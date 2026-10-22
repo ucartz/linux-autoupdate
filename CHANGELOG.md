@@ -2,6 +2,51 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.1.0] - 2026-10-23
+
+### Added
+- One-command use: `curl -fsSL <url> | sudo bash` finds and installs all
+  updates, `... | sudo bash -s -- check` only looks, and
+  `auto-update.sh install --enable` installs the tool and turns on the schedule
+  in a single step. The script now also runs correctly when piped into bash.
+- `STATUS:` line at the end of every run and check (`UP TO DATE`,
+  `UPDATES PENDING`, `REBOOT REQUIRED`, `CANNOT CONFIRM ...`, `NOT UP TO DATE`)
+  so it is always clear whether the server is updated.
+- After an update the script reports that packages were updated to the latest
+  version and fixed (patches applied).
+- Ubuntu phased updates are listed separately from updates that can be
+  installed now, so the list and the count agree.
+- `release-upgrade` command (Ubuntu): shows the pros and cons of a new release,
+  asks yes/no, runs safety checks, offers a backup (different location, this
+  server, existing snapshot, or none), upgrades with automatic repair and
+  retries, verifies services afterwards and offers a reboot. It is interactive
+  and never started by the timer or cron, which only report that a release is
+  available (log, `status`, open terminals).
+- `--security` option for one-off security-only runs, `enable --cron` to force
+  cron, `install --enable`.
+- Non-root users: the script re-runs itself with `sudo` or prints the exact
+  command to use.
+- Gap handling for the update process: waits for the package-manager lock,
+  retries the package list refresh, keeps going when a single extra repository
+  is broken, repairs an interrupted package install before updating, repairs and
+  retries once when an update fails, checks free disk space, runs fully
+  non-interactive, ignores SSH hang-ups during an update, and waits for another
+  running update instead of failing.
+- Detects expired, unreachable or end-of-life repositories and says that the
+  result cannot be confirmed instead of reporting "up to date".
+- Post-reboot check restarts a service that did not come back, once, before
+  reporting it as failed.
+- `NOTIFY_TERMINALS`, `RELEASE_UPGRADE_CHECK` and `BACKUP_PATHS` options.
+
+### Changed
+- A failed package list refresh now fails the run (it used to be reported as
+  success with nothing to do).
+
+### Fixed
+- `/etc/os-release` is no longer sourced into the script, which overwrote the
+  `VERSION` variable.
+- Missing `hostname` command on minimal systems no longer prints errors.
+
 ## [2.0.0] - 2026-10-22
 
 ### Added
