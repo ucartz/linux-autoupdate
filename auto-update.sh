@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 PROG="linux-autoupdate"
 BIN="/usr/local/sbin/linux-autoupdate"
 LEGACY_BIN="/usr/local/sbin/auto-update.sh"
@@ -64,6 +64,23 @@ REBOOT_REASON=""
 W_DAYS="*"
 W_START=0
 W_END=0
+OS_ID=""
+OS_PRETTY=""
+OS_VERSION_ID=""
+RELEASE_AVAILABLE=""
+BACKUP_LOCATION=""
+PF_FAIL=0
+PF_WARN=0
+PENDING_AFTER=0
+DEFERRED_COUNT=0
+RUN_FROM_PIPE=0
+FLAG_ENABLE=0
+FORCE_CRON=0
+LOG_START=0
+REFRESH_FAILED=0
+REPO_PROBLEM=""
+REPO_HINT=""
+APT_NET=(-o DPkg::Lock::Timeout=600 -o Acquire::Retries=3 -o APT::Update::Error-Mode=any)
 
 # ---------------------------------------------------------------- helpers ---
 
@@ -139,8 +156,10 @@ Usage: $PROG <command> [options]
 
 Commands:
   install      Copy to $BIN, create the config, logrotate rule and
-               timer. Auto-updates stay DISABLED until you run 'enable'.
-  enable       Enable and start the systemd timer (cron if no systemd)
+               timer. Auto-updates stay DISABLED until you run 'enable'
+               (or use 'install --enable' to do both in one step).
+  enable       Enable and start the systemd timer (cron if no systemd;
+               'enable --cron' forces a cron entry instead)
   disable      Stop the timer / remove the cron entry
   status       Show scheduler state, last run, pending updates, reboot and
                livepatch status
@@ -148,11 +167,16 @@ Commands:
   check        List pending updates, change nothing
   uninstall    Remove timer, cron, logrotate rule and binary; keeps config and
                logs unless --purge is given
+  release-upgrade
+               Ubuntu only: review a new OS release (pros/cons), back up,
+               and upgrade with automatic repair. Interactive; never run
+               by the timer or cron.
 
 Legacy options (still supported):
   (no arguments)   update everything
   --check          same as 'check'
   --php-only       update only PHP packages
+  --security       security updates only (apt, dnf, yum, zypper)
   --reboot         reboot automatically if a reboot is required
   --version        print the version
   -h, --help       show this help
@@ -165,13 +189,16 @@ parse_args() {
   local arg
   for arg in "$@"; do
     case "$arg" in
-      install|enable|disable|status|run|check|uninstall|postboot)
+      install|enable|disable|status|run|check|uninstall|release-upgrade|postboot)
         [[ -n $CMD ]] && { echo "Only one command allowed: $CMD, $arg" >&2; exit 1; }
         CMD="$arg" ;;
       --check)    LEGACY_CHECK=1 ;;
       --php-only) MODE_OVERRIDE="php" ;;
+      --security) MODE_OVERRIDE="security" ;;
       --reboot)   FLAG_REBOOT=1 ;;
       --purge)    PURGE=1 ;;
+      --enable)   FLAG_ENABLE=1 ;;
+      --cron)     FORCE_CRON=1 ;;
       --random-delay=*)
         RANDOM_DELAY_ARG=${arg#*=}
         [[ $RANDOM_DELAY_ARG =~ ^[0-9]+$ ]] || { echo "Bad value for --random-delay" >&2; exit 1; } ;;
@@ -189,6 +216,15 @@ parse_args() {
   [[ -z $CMD ]] && CMD="legacy"
   if (( PURGE )) && [[ $CMD != uninstall ]]; then
     echo "--purge is only valid with 'uninstall'" >&2; exit 1
+  fi
+  if (( FLAG_ENABLE )) && [[ $CMD != install ]]; then
+    echo "--enable is only valid with 'install'" >&2; exit 1
+  fi
+  if (( FORCE_CRON )) && [[ $CMD != install && $CMD != enable ]]; then
+    echo "--cron is only valid with 'install --enable' or 'enable'" >&2; exit 1
+  fi
+  if (( FORCE_CRON )) && [[ $CMD == install ]] && (( ! FLAG_ENABLE )); then
+    echo "--cron needs --enable when used with 'install'" >&2; exit 1
   fi
   return 0
 }
@@ -212,6 +248,8 @@ set_defaults() {
   TELEGRAM_CHAT_ID=""
   ALLOW_ON_PANELS=0
   NOTIFY_TERMINALS=1
+  RELEASE_UPGRADE_CHECK=1
+  BACKUP_PATHS="/etc /var/www /home /root /var/spool/cron /opt /srv"
 }
 
 write_config_template() {
@@ -280,6 +318,14 @@ ALLOW_ON_PANELS=0
 # 1 = after a scheduled run, print the result on any terminal that is open
 # (SSH/console sessions). Nothing is printed when nobody is logged in.
 NOTIFY_TERMINALS=1
+
+# 1 = check for a new Ubuntu release after each run and report it. The upgrade
+# itself is never started automatically: run "linux-autoupdate release-upgrade".
+RELEASE_UPGRADE_CHECK=1
+
+# Paths included when you choose to back up before a release upgrade.
+# Databases (MySQL/MariaDB/PostgreSQL) are dumped separately when running.
+BACKUP_PATHS="/etc /var/www /home /root /var/spool/cron /opt /srv"
 EOF
 }
 
@@ -343,6 +389,12 @@ validate_config() {
   [[ $SKIP_REBOOT_IF_USERS == [01] ]] || cfg_err "SKIP_REBOOT_IF_USERS must be 0 or 1"
   [[ $ALLOW_ON_PANELS == [01] ]] || cfg_err "ALLOW_ON_PANELS must be 0 or 1"
   [[ $NOTIFY_TERMINALS == [01] ]] || cfg_err "NOTIFY_TERMINALS must be 0 or 1"
+  [[ $RELEASE_UPGRADE_CHECK == [01] ]] || cfg_err "RELEASE_UPGRADE_CHECK must be 0 or 1"
+  re='^/[A-Za-z0-9._/+@-]*$'
+  read -ra excl_check <<<"$BACKUP_PATHS"
+  for p in ${excl_check[@]+"${excl_check[@]}"}; do
+    [[ $p =~ $re ]] || cfg_err "BACKUP_PATHS entry '$p' must be an absolute path without spaces"
+  done
   if [[ $REBOOT_POLICY == window ]]; then
     parse_window || cfg_err "REBOOT_WINDOW must look like \"Sun 03:00-05:00\" (days optional)"
   fi
@@ -409,7 +461,9 @@ json_escape() {
   printf '%s' "$s"
 }
 
-host_name() { hostname -f 2>/dev/null || hostname; }
+host_name() {
+  hostname -f 2>/dev/null || hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n
+}
 
 # notify <failure|success> <subject> <body>
 notify() {
@@ -684,12 +738,125 @@ pending_count() {
   return 0
 }
 
+# apt: packages that are listed as upgradable but cannot be installed right
+# now (Ubuntu phased rollout, or held back). Prints one name per line.
+apt_deferred() {
+  comm -13 <(apt-get -s dist-upgrade 2>/dev/null | awk '/^Inst / {print $2}' | sort -u) \
+           <(apt list --upgradable 2>/dev/null | awk -F/ 'NR > 1 && NF > 1 {print $1}' | sort -u)
+}
+
+# Sets DEFERRED_COUNT (apt only).
+count_deferred() {
+  DEFERRED_COUNT=0
+  [[ $PM == apt ]] || return 0
+  DEFERRED_COUNT=$(apt_deferred | grep -c .)
+  return 0
+}
+
+apt_check_report() {
+  local inst deferred d
+  inst=$(apt-get -s dist-upgrade 2>/dev/null | awk '/^Inst / {
+    name = $2
+    if ($3 ~ /^\[/) { old = $3; new = $4 } else { old = "(new package)"; new = $3 }
+    gsub(/\[|\]|\(/, "", old); gsub(/\(/, "", new)
+    printf "  %-38s %s -> %s\n", name, old, new }')
+  deferred=$(apt_deferred)
+  if [[ -n $inst ]]; then
+    echo "Can be installed now:"
+    echo "$inst"
+  else
+    echo "Nothing can be installed right now."
+  fi
+  if [[ -n $deferred ]]; then
+    echo
+    echo "Not installed yet - Ubuntu releases these to servers in phases (or they are"
+    echo "held back). They install automatically on a later run; no action needed:"
+    while read -r d; do printf '  %s\n' "$d"; done <<<"$deferred"
+  fi
+}
+
+# True if the part of the log written since this run started shows at least one
+# repository that was fetched successfully: "Hit:" lines, or "Get:" lines that
+# carry a downloaded size (a failed fetch also prints "Get:" but with no size).
+apt_refresh_partial() {
+  tail -c "+$((LOG_START + 1))" "$LOG" 2>/dev/null | grep -qE '^(Hit:|Get:[0-9]+ .*\[[0-9.]+ ?[kKMG]?B\])'
+}
+
+# Refresh package lists. Retries on failure; for apt, a few broken repositories
+# (e.g. one dead PPA) do not fail the run as long as the others worked.
 pm_refresh() {
+  local attempt rc
   case "$PM" in
-    apt)    pkg_run apt-get update ;;
-    zypper) pkg_run zypper --non-interactive refresh ;;
-    apk)    pkg_run apk update ;;
+    apt|zypper|apk) ;;
+    *) return 0 ;;
   esac
+  for attempt in 1 2 3; do
+    case "$PM" in
+      apt)    run apt-get "${APT_NET[@]}" update ;;
+      zypper) run zypper --non-interactive refresh ;;
+      apk)    run apk update ;;
+    esac
+    rc=$?
+    if (( rc == 0 )); then return 0; fi
+    if [[ $PM == apt ]] && apt_refresh_partial; then
+      log "WARNING: some repositories could not be refreshed; continuing with the ones that worked."
+      return 0
+    fi
+    if (( attempt < 3 )); then
+      log "Refreshing the package lists failed (attempt $attempt of 3) - retrying in 10 seconds."
+      sleep 10
+    fi
+  done
+  FAILED=1
+  REFRESH_FAILED=1
+  log "ERROR: could not refresh the package lists after 3 attempts."
+  return 0
+}
+
+# Look at what the package manager printed during this run and spot repositories
+# that are expired, unreachable or unsigned. Sets REPO_PROBLEM and REPO_HINT.
+scan_repo_problems() {
+  local text all hits
+  REPO_PROBLEM=""
+  REPO_HINT=""
+  text=$(tail -c "+$((LOG_START + 1))" "$LOG" 2>/dev/null)
+  all=$(grep -Ei '^(Err:|E: Failed to fetch)|does not have a Release file|404 +Not Found|Release file .* expired|NO_PUBKEY|is not signed|metadata expired|Valid metadata not found|Failed to download metadata|Cannot find a valid baseurl|Errors during downloading metadata|Cannot download repomd|Failed to synchronize cache|Could not resolve|Temporary failure resolving|Failed retrieving file|^ERROR: .*(fetch|temporary)|Connection (timed out|refused)|^W: Failed to fetch' <<<"$text")
+  [[ -n $all ]] || return 0
+  hits=$(head -n 3 <<<"$all")
+  REPO_PROBLEM=$hits
+  if grep -Eiq 'metadata expired|does not have a Release file|404 +Not Found|Release file .* expired|Valid metadata' <<<"$all"; then
+    REPO_HINT="This OS release may have reached end of life, so its repositories no longer receive updates. Move to a supported release (Ubuntu: '$PROG release-upgrade')."
+  elif grep -Eiq 'resolv|Connection|timed out|refused|Could not connect|Network is unreachable' <<<"$all"; then
+    REPO_HINT="Check DNS, internet access and any proxy configured on this server."
+  elif grep -Eiq 'NO_PUBKEY|not signed' <<<"$all"; then
+    REPO_HINT="A repository signing key is missing or expired. Fix or remove that repository."
+  else
+    REPO_HINT="See $LOG for the full error."
+  fi
+  return 0
+}
+
+report_repo_problems() {
+  local l
+  [[ -n $REPO_PROBLEM ]] || return 0
+  log "WARNING: package source problem(s) detected - the result may be incomplete:"
+  while read -r l; do log "    $l"; done <<<"$REPO_PROBLEM"
+  log "HINT: $REPO_HINT"
+}
+
+# Make sure there is room to update; clean the package cache first if needed.
+check_disk_space() {
+  local avail
+  avail=$(df -Pk / | awk 'NR==2 {print $4}')
+  if (( avail < 307200 )) && [[ $PM == apt ]]; then
+    log "Low disk space ($(( avail / 1024 )) MB free) - cleaning the apt cache."
+    run apt-get clean
+    avail=$(df -Pk / | awk 'NR==2 {print $4}')
+  fi
+  if (( avail < 307200 )); then
+    log "ERROR: only $(( avail / 1024 )) MB free on / - not enough to update safely. Free some space (logs, old kernels, caches) and run again."
+    return 1
+  fi
   return 0
 }
 
@@ -699,7 +866,7 @@ pm_check() {
       case "$UPDATE_MODE_EFFECTIVE" in
         security) apt-get -s dist-upgrade 2>/dev/null | awk '/^Inst / && /[Ss]ecurity/' | tee -a "$LOG" ;;
         php)      apt list --upgradable 2>/dev/null | grep -i '^php' | tee -a "$LOG" ;;
-        *)        apt list --upgradable 2>/dev/null | tee -a "$LOG" ;;
+        *)        apt_check_report | tee -a "$LOG" ;;
       esac ;;
     dnf|yum)
       case "$UPDATE_MODE_EFFECTIVE" in
@@ -736,8 +903,8 @@ pm_update() {
   local PKGS=() name names
   case "$PM" in
     apt)
-      export DEBIAN_FRONTEND=noninteractive
-      local APT_OPTS=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+      export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none UCF_FORCE_CONFFOLD=1
+      local APT_OPTS=(-y "${APT_NET[@]}" -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
       case "$UPDATE_MODE_EFFECTIVE" in
         php)
           while read -r name; do
@@ -757,7 +924,7 @@ pm_update() {
           fi ;;
         *)
           pkg_run apt-get dist-upgrade "${APT_OPTS[@]}"
-          pkg_run apt-get autoremove -y ;;
+          pkg_run apt-get autoremove -y "${APT_NET[@]}" ;;
       esac ;;
     dnf|yum)
       case "$UPDATE_MODE_EFFECTIVE" in
@@ -830,8 +997,18 @@ restart_php_services() {
 # --------------------------------------------------------- update workflow ---
 
 acquire_lock() {
+  if ! command -v flock >/dev/null 2>&1; then
+    log "WARNING: flock not found - cannot prevent two updates from running at once."
+    return 0
+  fi
   exec 9>"$LOCK"
-  flock -n 9 || { echo "Another update is already running."; exit 1; }
+  if flock -n 9; then return 0; fi
+  if (( VERBOSE )); then
+    echo "Another update is already running - waiting up to 10 minutes for it to finish..."
+    flock -w 600 9 && return 0
+  fi
+  echo "Another update is already running."
+  exit 1
 }
 
 run_hook() {
@@ -864,43 +1041,74 @@ finish_run() {
   state_set PACKAGES_UPDATED "$UPDATED"
   state_set REBOOT_PENDING "$REBOOT_PENDING"
   state_set REBOOT_NOTE "$REBOOT_NOTE"
+  state_set LAST_WARNING "$(printf '%s' "$REPO_PROBLEM" | head -n1)"
   case "$RESULT" in
     success)
       if (( UPDATED > 0 )); then
-        log "SUCCESS: update completed - $UPDATED package(s) updated."
+        if [[ $UPDATE_MODE_EFFECTIVE == security ]]; then
+          log "SUCCESS: $UPDATED security update(s) installed - updated to the latest version and the fixes are applied."
+        else
+          log "SUCCESS: update completed - $UPDATED package(s) updated to the latest version and fixed (patches applied)."
+        fi
       else
         log "Nothing found - no updates available."
+      fi
+      if [[ -n $REPO_PROBLEM ]]; then
+        report_repo_problems
+        log "STATUS: CANNOT CONFIRM THE SYSTEM IS UP TO DATE - fix the package source problem above."
+      elif (( PENDING_AFTER > 0 )); then
+        log "STATUS: $PENDING_AFTER UPDATE(S) STILL PENDING - run it again or see $LOG."
+      else
+        log "STATUS: UP TO DATE - no updates pending."
+      fi
+      if (( REBOOT_PENDING )) && [[ $REBOOT_NOTE != rebooting ]]; then
+        log "STATUS: REBOOT REQUIRED to finish - run 'reboot' when it suits you (or re-run with --reboot)."
+      elif [[ $REBOOT_NOTE == rebooting ]]; then
+        log "STATUS: REBOOTING in 1 minute to finish the update."
+      fi
+      if (( DEFERRED_COUNT > 0 )); then
+        log "NOTE: $DEFERRED_COUNT more update(s) are waiting for Ubuntu's phased rollout (or are held back). They install automatically on a later run - no action needed."
       fi ;;
-    skipped) log "Nothing was updated (see the warning above)." ;;
-    *)       log "FAILED: the update did not complete - see $LOG for details." ;;
+    skipped) log "Nothing was updated (see the warning above)."
+             log "STATUS: NOT UPDATED - this update mode is not supported on this system." ;;
+    *)       log "FAILED: the update did not complete - see $LOG for details."
+             if [[ -n $REPO_PROBLEM ]]; then report_repo_problems; fi
+             log "STATUS: NOT UP TO DATE - the update failed or was refused; the system may be only partly updated." ;;
   esac
   log "==== Finished: $RESULT ===="
   subject="[$(host_name)] linux-autoupdate: $RESULT"
   body="Result: $RESULT
 Mode: $UPDATE_MODE_EFFECTIVE
 Packages updated: $UPDATED
-Reboot pending: $REBOOT_PENDING${REBOOT_NOTE:+ ($REBOOT_NOTE)}
+Reboot pending: $REBOOT_PENDING${REBOOT_NOTE:+ ($REBOOT_NOTE)}${RELEASE_AVAILABLE:+
+New Ubuntu release available: $RELEASE_AVAILABLE (run: $PROG release-upgrade)}
 Log: $LOG"
+  if [[ -n $REPO_PROBLEM ]]; then
+    body+="
+WARNING: package source problem - $(printf '%s' "$REPO_PROBLEM" | head -n1)
+$REPO_HINT"
+  fi
   case "$RESULT" in
-    success|skipped) notify success "$subject" "$body" ;;
+    success|skipped) if [[ -n $REPO_PROBLEM ]]; then notify failure "$subject" "$body"; else notify success "$subject" "$body"; fi ;;
     *)               notify failure "$subject" "$body" ;;
   esac
   if [[ $CMD == run ]]; then
-    tell_terminals "linux-autoupdate on $(host_name): $RESULT, $UPDATED package(s) updated${REBOOT_NOTE:+, reboot: $REBOOT_NOTE}. Details: $LOG"
+    tell_terminals "linux-autoupdate on $(host_name): $RESULT, $UPDATED package(s) updated${REBOOT_NOTE:+, reboot: $REBOOT_NOTE}${RELEASE_AVAILABLE:+; new release available: $RELEASE_AVAILABLE ($PROG release-upgrade)}. Details: $LOG"
   fi
   [[ $RESULT == success || $RESULT == skipped ]]
 }
 
 cmd_update() {
-  local before after decision
+  local before after decision rc
   (( RANDOM_DELAY_ARG > 0 )) && sleep $(( RANDOM % RANDOM_DELAY_ARG ))
   acquire_lock
   UPDATE_MODE_EFFECTIVE=${MODE_OVERRIDE:-$UPDATE_MODE}
+  LOG_START=$(wc -c <"$LOG" 2>/dev/null || echo 0)
+  trap '' HUP   # a dropped SSH session must not kill an update half-way
 
   # ---- Detect OS ----
-  # shellcheck disable=SC1091
-  [[ -f /etc/os-release ]] && . /etc/os-release
-  log "==== Start: ${PRETTY_NAME:-unknown OS} | kernel $(uname -r) | mode=$UPDATE_MODE_EFFECTIVE ===="
+  load_os_release
+  log "==== Start: ${OS_PRETTY:-unknown OS} | kernel $(uname -r) | mode=$UPDATE_MODE_EFFECTIVE ===="
   RUN_STARTED=1
   trap cleanup EXIT
   trap 'exit 130' INT
@@ -927,7 +1135,7 @@ cmd_update() {
     exit 1
   fi
   log "Package manager: $PM"
-  say "Detected ${PRETTY_NAME:-this system}; package manager: $PM; update mode: $UPDATE_MODE_EFFECTIVE"
+  say "Detected ${OS_PRETTY:-this system}; package manager: $PM; update mode: $UPDATE_MODE_EFFECTIVE"
 
   detect_livepatch
   if [[ -n $LIVEPATCH ]]; then log "Livepatch: $LIVEPATCH active"; else log "Livepatch: none detected"; fi
@@ -941,6 +1149,16 @@ cmd_update() {
 
   PHP_BEFORE=$(php -r 'echo PHP_VERSION;' 2>/dev/null || echo "none")
 
+  if ! check_disk_space; then
+    RESULT="failure"
+    finish_run
+    exit 1
+  fi
+  if [[ $PM == apt ]] && ! apt_health; then
+    log "The package system needs repair before updating (interrupted install?)."
+    apt_heal || log "WARNING: automatic repair did not fully succeed; continuing."
+  fi
+
   setup_exclusions
   say "Refreshing package lists..."
   pm_refresh
@@ -948,7 +1166,22 @@ cmd_update() {
   say "Found $before pending update(s)."
   say "Installing updates - this can take several minutes..."
   pm_update
+  if (( FAILED && ! REFRESH_FAILED )); then
+    case "$PM" in
+      apt|dnf|yum)
+        log "The update reported errors - trying to repair automatically and retrying once."
+        FAILED=0
+        if heal_pm; then
+          pm_update
+          if (( ! FAILED )); then log "Recovered: the retry after automatic repair succeeded."; fi
+        else
+          FAILED=1
+        fi ;;
+    esac
+  fi
   after=$(pending_count 0)
+  PENDING_AFTER=$after
+  count_deferred
   release_exclusions
   UPDATED=$(( before - after ))
   (( UPDATED < 0 )) && UPDATED=0
@@ -989,18 +1222,28 @@ cmd_update() {
       } ;;
   esac
 
+  scan_repo_problems
+
+  # ---- Is a new OS release available? (reported only; never started here) ----
+  release_check
+  state_set RELEASE_AVAILABLE "$RELEASE_AVAILABLE"
+  release_note
+
   if (( SKIPPED )); then RESULT="skipped"; fi
   if (( FAILED )); then RESULT="failure"; fi
   finish_run
+  rc=$?
+  if [[ $CMD == legacy ]] && (( ! FAILED )); then release_offer; fi
+  return "$rc"
 }
 
 cmd_check() {
   local total
   acquire_lock
   UPDATE_MODE_EFFECTIVE=${MODE_OVERRIDE:-$UPDATE_MODE}
-  # shellcheck disable=SC1091
-  [[ -f /etc/os-release ]] && . /etc/os-release
-  log "==== Start: ${PRETTY_NAME:-unknown OS} | kernel $(uname -r) | mode=check ===="
+  LOG_START=$(wc -c <"$LOG" 2>/dev/null || echo 0)
+  load_os_release
+  log "==== Start: ${OS_PRETTY:-unknown OS} | kernel $(uname -r) | mode=check ===="
   detect_panel
   if [[ $PANEL == cPanel ]]; then
     log "WARNING: cPanel detected - consider /scripts/upcp; EA-PHP is updated via yum/dnf."
@@ -1014,11 +1257,23 @@ cmd_check() {
   say "Pending updates:"
   pm_check
   total=$(pending_count 0)
+  count_deferred
+  scan_repo_problems
+  if [[ -n $REPO_PROBLEM ]]; then report_repo_problems; fi
   if (( total > 0 )); then
-    log "$total update(s) available."
+    log "$total update(s) can be installed now."
+    log "STATUS: UPDATES PENDING - run '$PROG' to install them (nothing was changed by this check)."
+  elif [[ -n $REPO_PROBLEM ]]; then
+    log "STATUS: CANNOT CONFIRM THE SYSTEM IS UP TO DATE - fix the package source problem above."
   else
     log "Nothing found - no updates available."
+    log "STATUS: UP TO DATE - nothing to install."
   fi
+  if (( DEFERRED_COUNT > 0 )); then
+    log "NOTE: $DEFERRED_COUNT more update(s) are waiting for Ubuntu's phased rollout (or are held back). They install automatically on a later run - no action needed."
+  fi
+  release_check
+  release_note
   log "==== Check finished (no changes made) ===="
 }
 
@@ -1158,7 +1413,7 @@ cmd_enable() {
   if [[ -n $PANEL ]] && (( ! ALLOW_ON_PANELS )); then
     die "$PANEL detected and ALLOW_ON_PANELS=0 - use the panel's updater, or set ALLOW_ON_PANELS=1 in $CONF"
   fi
-  if has_systemd; then
+  if has_systemd && (( ! FORCE_CRON )); then
     if command -v systemd-analyze >/dev/null 2>&1; then
       systemd-analyze calendar "$SCHEDULE" >/dev/null 2>&1 \
         || die "SCHEDULE \"$SCHEDULE\" is not a valid systemd calendar expression"
@@ -1170,6 +1425,9 @@ cmd_enable() {
     systemctl enable --now "$TIMER_UNIT" || die "could not enable $TIMER_UNIT"
     log "Auto-updates ENABLED via systemd timer (OnCalendar=$SCHEDULE, RandomizedDelaySec=$RANDOM_DELAY)"
   else
+    if has_systemd && [[ -f $UNIT_DIR/$TIMER_UNIT ]]; then
+      systemctl disable --now "$TIMER_UNIT" >/dev/null 2>&1
+    fi
     cron_enable
   fi
 }
@@ -1202,8 +1460,11 @@ EOF
 
 cmd_install() {
   local src tmp
+  (( RUN_FROM_PIPE )) && die "install needs the script saved as a file: download it with 'curl -o /usr/local/sbin/auto-update.sh ...', then run 'auto-update.sh install'"
   src=$(readlink -f "$0" 2>/dev/null) || src=$0
-  [[ -f $src ]] || die "install must be run from the script file, not from a pipe"
+  if [[ ! -f $src ]] || ! grep -q '^PROG="linux-autoupdate"' "$src"; then
+    die "install must be run from the downloaded script file"
+  fi
   install -d -m 0755 "$(dirname "$BIN")" "$STATE_DIR" || die "could not create directories"
   if [[ $src != "$BIN" ]]; then
     tmp=$(mktemp "$BIN.XXXXXX") || die "could not write to $(dirname "$BIN")"
@@ -1237,7 +1498,16 @@ cmd_install() {
     ln -sfn "$BIN" "$LEGACY_BIN"
     log "Replaced $LEGACY_BIN with a symlink to $BIN"
   fi
-  cat <<EOF
+  if (( FLAG_ENABLE )); then
+    cmd_enable
+    cat <<EOF
+
+$PROG $VERSION installed and auto-updates are ENABLED ($SCHEDULE).
+ - See the state any time:  $PROG status
+ - Change the settings:     $CONF  (then run: $PROG enable)
+EOF
+  else
+    cat <<EOF
 
 $PROG $VERSION installed. Auto-updates are DISABLED.
 Next steps:
@@ -1245,6 +1515,7 @@ Next steps:
   2. Try it:                $PROG check
   3. Turn on the schedule:  $PROG enable
 EOF
+  fi
 }
 
 cmd_uninstall() {
@@ -1273,9 +1544,10 @@ cmd_uninstall() {
 cmd_postboot() {
   VERBOSE=0
   [[ -f $MARKER ]] || return 0
-  local services=() failed=() ok=() svc kernel_before deadline subject body level
+  local services=() failed=() ok=() svc kernel_before release_from="" deadline subject body level line
   while IFS= read -r line; do
     case "$line" in
+      release_from=*) release_from=${line#release_from=} ;;
       service=*) services+=("${line#service=}") ;;
       kernel_before=*) kernel_before=${line#kernel_before=} ;;
     esac
@@ -1287,12 +1559,22 @@ cmd_postboot() {
       (( $(date +%s) >= deadline )) && break
       sleep 5
     done
+    if ! systemctl is-active --quiet "$svc"; then
+      log "Self-heal: $svc is not active, restarting it once"
+      systemctl restart "$svc" >>"$LOG" 2>&1
+      sleep 5
+    fi
     if systemctl is-active --quiet "$svc"; then
       ok+=("$svc"); log "OK: $svc is active"
     else
       failed+=("$svc"); log "FAILED: $svc is not active"
     fi
   done
+  if [[ -n $release_from ]]; then
+    load_os_release
+    log "Release upgrade check: $release_from -> ${OS_VERSION_ID:-?} (${OS_PRETTY:-?})"
+    if ! apt_health; then apt_heal || failed+=("package-system"); fi
+  fi
   if [[ ${#failed[@]} -gt 0 ]]; then
     level=failure
     state_set LAST_BOOT_CHECK "FAILED: ${failed[*]}"
@@ -1317,7 +1599,7 @@ Log: $LOG"
 
 cmd_status() {
   VERBOSE=0
-  local sched next last_run last_result updated pending note live
+  local sched next last_run last_result updated pending note live rel
   sched=$(scheduler_state)
   case "$sched" in
     systemd) echo "Auto-updates:     enabled (systemd timer)" ;;
@@ -1343,7 +1625,16 @@ cmd_status() {
   fi
   if detect_pm; then
     pending=$(pending_count 1)
+    count_deferred
+    if (( ${pending:-0} > 0 )); then
+      echo "System:           UPDATES PENDING - ${pending} can be installed now (run '$PROG')"
+    else
+      echo "System:           UP TO DATE - nothing to install"
+    fi
     echo "Pending updates:  ${pending:-0} (from cached package metadata, $PM; run '$PROG check' to refresh)"
+    if (( DEFERRED_COUNT > 0 )); then
+      echo "Deferred:         $DEFERRED_COUNT (Ubuntu phased rollout / held back - install automatically later)"
+    fi
   else
     echo "Pending updates:  unknown (no supported package manager)"
   fi
@@ -1363,6 +1654,15 @@ cmd_status() {
   else
     echo "Livepatch:        none detected"
   fi
+  rel=$(state_get RELEASE_AVAILABLE)
+  if [[ -n $rel ]]; then
+    echo "Release upgrade:  Ubuntu $rel available (review it with: $PROG release-upgrade)"
+  else
+    echo "Release upgrade:  no new release known (checked on the last run)"
+  fi
+  if [[ -n $(state_get LAST_RELEASE_UPGRADE) ]]; then
+    echo "Last upgrade:     $(state_get LAST_RELEASE_UPGRADE) (backup: $(state_get BACKUP_LOCATION))"
+  fi
   echo "Update mode:      $UPDATE_MODE | reboot policy: $REBOOT_POLICY | notify: $NOTIFY"
   if [[ -n $(state_get LAST_BOOT_CHECK) ]]; then
     echo "Post-reboot check: $(state_get LAST_BOOT_CHECK) ($(state_get LAST_BOOT_CHECK_TIME))"
@@ -1370,11 +1670,584 @@ cmd_status() {
   return 0
 }
 
+# ------------------------------------------------------- release upgrade ---
+# Interactive OS release upgrade (Ubuntu only). Never started by the timer,
+# cron or 'run': those only record that a new release is available.
+
+is_tty() { [[ -t 0 && -t 1 ]]; }
+
+# ask_yn "question" y|n  -> 0 for yes, 1 for no / end of input
+ask_yn() {
+  local ans hint="[y/N]"
+  [[ $2 == y ]] && hint="[Y/n]"
+  while true; do
+    read -r -p "$1 $hint " ans || return 1
+    ans=${ans,,}
+    case "$ans" in
+      y|yes) return 0 ;;
+      n|no)  return 1 ;;
+      "")    [[ $2 == y ]]; return ;;
+    esac
+    echo "Please answer yes or no."
+  done
+}
+
+# Read /etc/os-release without letting its variables (e.g. VERSION) leak in.
+load_os_release() {
+  OS_ID=""
+  OS_PRETTY=""
+  OS_VERSION_ID=""
+  [[ -f /etc/os-release ]] || return 0
+  # shellcheck disable=SC1091
+  OS_ID=$(. /etc/os-release; printf '%s' "${ID:-}")
+  # shellcheck disable=SC1091
+  OS_PRETTY=$(. /etc/os-release; printf '%s' "${PRETTY_NAME:-}")
+  # shellcheck disable=SC1091
+  OS_VERSION_ID=$(. /etc/os-release; printf '%s' "${VERSION_ID:-}")
+}
+
+# Sets RELEASE_AVAILABLE (e.g. "26.04.1 LTS") when Ubuntu offers a new release.
+release_check() {
+  local out
+  RELEASE_AVAILABLE=""
+  (( RELEASE_UPGRADE_CHECK )) || return 0
+  [[ $OS_ID == ubuntu ]] || return 0
+  command -v do-release-upgrade >/dev/null 2>&1 || return 0
+  out=$(timeout 90 do-release-upgrade -c 2>&1) || true
+  RELEASE_AVAILABLE=$(sed -n "s/^New release '\\(.*\\)' available\\.\$/\\1/p" <<<"$out" | head -n1)
+  return 0
+}
+
+release_note() {
+  [[ -n $RELEASE_AVAILABLE ]] || return 0
+  log "NOTE: a new Ubuntu release is available: $RELEASE_AVAILABLE. Run '$PROG release-upgrade' in a terminal to review and upgrade."
+}
+
+detect_stack() {
+  local out="" v
+  v=$(php -r 'echo PHP_VERSION;' 2>/dev/null)
+  [[ -n $v ]] && out+="PHP $v, "
+  if command -v mariadbd >/dev/null 2>&1 || command -v mariadb >/dev/null 2>&1; then
+    out+="MariaDB, "
+  elif command -v mysqld >/dev/null 2>&1; then
+    out+="MySQL, "
+  fi
+  command -v psql >/dev/null 2>&1 && out+="PostgreSQL, "
+  command -v nginx >/dev/null 2>&1 && out+="nginx, "
+  command -v apache2 >/dev/null 2>&1 && out+="Apache, "
+  printf '%s' "${out%, }"
+}
+
+show_release_info() {
+  local stack
+  stack=$(detect_stack)
+  cat <<EOF
+
+================================================================
+ A new Ubuntu release is available: Ubuntu $RELEASE_AVAILABLE
+ This server runs:                  ${OS_PRETTY:-unknown}
+================================================================
+ Pros of upgrading
+   + Longer security and bug-fix support (a new LTS is supported 5 years)
+   + Newer kernel, hardware support, and newer PHP / database / web server
+   + You avoid running an unsupported release after the current one ends
+
+ Cons and risks
+   - Big version jump: PHP, MySQL/MariaDB, Apache/nginx, Python and others
+     can change version and configuration. Websites and apps can break and
+     must be tested afterwards.
+   - Takes about 30-90 minutes and ends with a reboot
+   - Third-party repositories (PPAs) are disabled during the upgrade
+   - It cannot be rolled back. The only way back is a backup or snapshot.
+   - Not supported on cPanel / Plesk servers
+EOF
+  if [[ -n $stack ]]; then
+    echo
+    echo " Found on this server: $stack"
+    echo " These are likely to change version in the upgrade."
+  fi
+  cat <<EOF
+
+ If you answer "no", nothing changes: you keep the current release with
+ all the latest updates installed.
+================================================================
+EOF
+}
+
+# ---- self-healing helpers ----
+
+apt_health() {
+  [[ -z $(dpkg --audit 2>/dev/null) ]] && apt-get check >/dev/null 2>&1
+}
+
+apt_heal() {
+  log "Self-heal: repairing the package system"
+  run dpkg --configure -a
+  run apt-get -f install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+  run apt-get update
+  apt_health
+}
+
+# Try to repair the package manager after a failed update (used before one retry).
+heal_pm() {
+  case "$PM" in
+    apt)     apt_heal ;;
+    dnf|yum) run "$PM" clean all && run "$PM" makecache ;;
+    *)       return 1 ;;
+  esac
+}
+
+# ---- pre-flight checks ----
+
+pf() {  # pf ok|warn|fail "message"
+  case "$1" in
+    ok)   printf '  [ ok ] %s\n' "$2" ;;
+    warn) printf '  [warn] %s\n' "$2"; PF_WARN=$((PF_WARN + 1)) ;;
+    fail) printf '  [FAIL] %s\n' "$2"; PF_FAIL=$((PF_FAIL + 1)) ;;
+  esac
+  printf '[%s] preflight %s: %s\n' "$(now)" "$1" "$2" >>"$LOG"
+}
+
+third_party_sources() {
+  {
+    grep -hE '^[[:space:]]*deb(-src)?[[:space:]]' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null
+    grep -hE '^URIs:' /etc/apt/sources.list.d/*.sources 2>/dev/null
+  } | grep -viE 'ubuntu\.com|/ubuntu'
+}
+
+release_preflight() {
+  local held avail boot_avail n
+  PF_FAIL=0
+  PF_WARN=0
+  echo
+  echo "Safety checks before the upgrade:"
+  detect_panel
+  if [[ -n $PANEL ]]; then
+    pf fail "$PANEL detected - its updater controls the OS; do not release-upgrade it with this tool"
+  else
+    pf ok "no control panel (cPanel/Plesk) detected"
+  fi
+
+  say "Bringing the system fully up to date first..."
+  FAILED=0
+  UPDATE_MODE_EFFECTIVE="all"
+  pm_refresh
+  pm_update
+  if (( FAILED )) && heal_pm; then FAILED=0; pm_update; fi
+  if (( FAILED )); then
+    pf fail "the system could not be fully updated first (see $LOG)"
+  else
+    pf ok "system is fully up to date"
+  fi
+
+  if apt_health || { apt_heal; }; then
+    pf ok "package system is healthy"
+  else
+    pf fail "the package system is broken (dpkg --audit / apt-get check) and automatic repair failed"
+  fi
+
+  reboot_required
+  if (( NEED_REBOOT )); then
+    pf fail "a reboot is pending ($REBOOT_REASON) - reboot first, then run '$PROG release-upgrade' again"
+  else
+    pf ok "no reboot pending"
+  fi
+
+  held=$(apt-mark showhold 2>/dev/null | tr '\n' ' ')
+  if [[ -n $held ]]; then
+    pf warn "held packages can block the upgrade: $held"
+  else
+    pf ok "no held packages"
+  fi
+
+  avail=$(df -Pk / | awk 'NR==2 {print $4}')
+  if (( avail < 6291456 )); then
+    pf fail "less than 6 GB free on / ($(( avail / 1024 )) MB free)"
+  else
+    pf ok "enough free disk space on / ($(( avail / 1024 )) MB)"
+  fi
+  if mountpoint -q /boot 2>/dev/null; then
+    boot_avail=$(df -Pk /boot | awk 'NR==2 {print $4}')
+    if (( boot_avail < 307200 )); then
+      pf warn "/boot has only $(( boot_avail / 1024 )) MB free; old kernels may need removing"
+    fi
+  fi
+
+  n=$(third_party_sources | wc -l)
+  if (( n > 0 )); then
+    pf warn "$n third-party apt source line(s) found; the upgrade will disable them"
+  else
+    pf ok "no third-party apt sources"
+  fi
+
+  if [[ -n ${SSH_CONNECTION:-} && -z ${TMUX:-} && -z ${STY:-} ]]; then
+    pf warn "you are on SSH outside tmux/screen; if the connection drops the upgrade could be interrupted (run 'tmux' first)"
+  else
+    pf ok "session is protected (console, tmux or screen)"
+  fi
+
+  if [[ -n $PRE_UPDATE_HOOK ]]; then
+    if run_hook; then pf ok "PRE_UPDATE_HOOK succeeded"; else pf fail "PRE_UPDATE_HOOK failed"; fi
+  fi
+
+  echo
+  if (( PF_FAIL > 0 )); then
+    echo "Cannot continue: fix the items marked [FAIL] and run '$PROG release-upgrade' again."
+    return 1
+  fi
+  if (( PF_WARN > 0 )); then
+    ask_yn "Continue despite $PF_WARN warning(s)?" n || return 1
+  fi
+  return 0
+}
+
+# ---- backup ----
+
+# Build a backup set in directory $1 (files, package lists, database dumps, checksums).
+make_backup() {
+  local dir=$1 paths=() rel=() p est avail rc
+  mkdir -p "$dir" || return 1
+  chmod 0700 "$dir"
+  read -ra want <<<"$BACKUP_PATHS"
+  for p in "${want[@]}"; do
+    [[ -e $p ]] && paths+=("$p")
+  done
+  [[ ${#paths[@]} -gt 0 ]] || { echo "None of BACKUP_PATHS exist: $BACKUP_PATHS"; return 1; }
+  say "Estimating backup size..."
+  est=$(du -skc "${paths[@]}" 2>/dev/null | tail -n1 | awk '{print $1}')
+  avail=$(df -Pk "$dir" | awk 'NR==2 {print $4}')
+  if (( est > avail )); then
+    echo "Not enough free space for the backup: need about $(( est / 1024 )) MB, have $(( avail / 1024 )) MB."
+    return 1
+  fi
+  for p in "${paths[@]}"; do rel+=("${p#/}"); done
+  say "Archiving: ${paths[*]}"
+  tar -czpf "$dir/files.tar.gz" --ignore-failed-read --exclude="${dir#/}" -C / "${rel[@]}" 2>>"$LOG"
+  rc=$?
+  if (( rc > 1 )); then echo "Archiving failed (tar exit $rc), see $LOG."; return 1; fi
+
+  cp /etc/os-release "$dir/os-release.txt" 2>/dev/null
+  dpkg --get-selections >"$dir/packages.selections" 2>/dev/null
+  apt-mark showmanual >"$dir/packages.manual" 2>/dev/null
+  apt-mark showhold >"$dir/packages.hold" 2>/dev/null
+
+  if { pgrep -x mysqld || pgrep -x mariadbd; } >/dev/null 2>&1 && command -v mysqldump >/dev/null 2>&1; then
+    say "Dumping MySQL/MariaDB databases..."
+    mysqldump --all-databases --single-transaction --routines --events --triggers 2>"$dir/mysqldump.err" \
+      | gzip >"$dir/mysql-all-databases.sql.gz"
+    if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
+      echo "The database dump failed: $(head -c 300 "$dir/mysqldump.err")"
+      ask_yn "Continue the backup without the MySQL/MariaDB dump?" n || return 1
+      rm -f "$dir/mysql-all-databases.sql.gz"
+    fi
+  fi
+  if pgrep -x postgres >/dev/null 2>&1 && command -v pg_dumpall >/dev/null 2>&1; then
+    say "Dumping PostgreSQL databases..."
+    runuser -u postgres -- pg_dumpall 2>"$dir/pg_dumpall.err" | gzip >"$dir/postgres-all.sql.gz"
+    if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
+      echo "The PostgreSQL dump failed: $(head -c 300 "$dir/pg_dumpall.err")"
+      ask_yn "Continue the backup without the PostgreSQL dump?" n || return 1
+      rm -f "$dir/postgres-all.sql.gz"
+    fi
+  fi
+
+  cat >"$dir/RESTORE.txt" <<EOF
+Backup made by $PROG $VERSION on $(now) from $(host_name) ($OS_PRETTY).
+
+Restore files:        tar -xzpf files.tar.gz -C /
+Restore MySQL/MariaDB: zcat mysql-all-databases.sql.gz | mysql
+Restore PostgreSQL:    zcat postgres-all.sql.gz | runuser -u postgres -- psql
+Reinstall packages:    dpkg --set-selections < packages.selections && apt-get dselect-upgrade
+Check integrity:       sha256sum -c SHA256SUMS
+EOF
+  # shellcheck disable=SC2094
+  (cd "$dir" && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | sort | xargs sha256sum >SHA256SUMS)
+  if ! { (cd "$dir" && sha256sum -c SHA256SUMS >/dev/null 2>&1) && tar -tzf "$dir/files.tar.gz" >/dev/null 2>&1; }; then
+    echo "Backup verification failed."
+    return 1
+  fi
+  echo "Backup verified: $dir ($(du -sh "$dir" | awk '{print $1}'))"
+}
+
+backup_local() {  # $1 = base directory, $2 = description
+  local base=$1 dir
+  [[ $base =~ ^/[A-Za-z0-9._/+@-]+$ ]] || { echo "Please give an absolute path without spaces."; return 1; }
+  if [[ ! -d $base ]]; then
+    ask_yn "$base does not exist. Create it?" y || return 1
+    mkdir -p "$base" || return 1
+  fi
+  if [[ $2 == different ]] && [[ $(stat -c %d "$base") == "$(stat -c %d /)" ]]; then
+    echo "$base is on the same disk as the system, so it is not a different location."
+    echo "Use a separate disk/mount, a remote server, or choose option 2."
+    return 1
+  fi
+  dir="$base/linux-autoupdate-backup-$(host_name)-$(date +%Y%m%d-%H%M%S)"
+  make_backup "$dir" || return 1
+  BACKUP_LOCATION="$dir"
+}
+
+backup_remote() {  # $1 = [user@]host:/path
+  local dest=$1 host rpath stage name
+  host=${dest%%:*}
+  rpath=${dest#*:}
+  if ! command -v ssh >/dev/null 2>&1 || ! command -v scp >/dev/null 2>&1; then
+    echo "ssh/scp not found."
+    return 1
+  fi
+  name="linux-autoupdate-backup-$(host_name)-$(date +%Y%m%d-%H%M%S)"
+  stage=$(mktemp -d /var/tmp/lau-backup.XXXXXX) || return 1
+  echo "Checking the connection to $host (you may be asked for a password)..."
+  if ! ssh -o ConnectTimeout=15 "$host" "mkdir -p '$rpath'"; then
+    echo "Could not reach $host."
+    rm -rf "$stage"
+    return 1
+  fi
+  if ! make_backup "$stage/$name"; then rm -rf "$stage"; return 1; fi
+  say "Copying the backup to $host:$rpath ..."
+  if ! scp -rpq -o ConnectTimeout=15 "$stage/$name" "$host:$rpath/"; then
+    echo "Copy failed."
+    rm -rf "$stage"
+    return 1
+  fi
+  if ! ssh -o ConnectTimeout=15 "$host" "cd '$rpath/$name' && sha256sum -c SHA256SUMS >/dev/null 2>&1"; then
+    echo "The copy on $host failed its checksum verification."
+    rm -rf "$stage"
+    return 1
+  fi
+  rm -rf "$stage"
+  BACKUP_LOCATION="$host:$rpath/$name"
+  echo "Backup copied and verified on $host:$rpath/$name"
+}
+
+# Returns 0 when it is safe to continue, 1 when the user cancelled.
+backup_flow() {
+  local choice dest re_remote='^([A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+:/[A-Za-z0-9._/+@-]+$'
+  echo
+  echo "Data safety - a release upgrade cannot be undone, so back up first."
+  while true; do
+    cat <<'EOF'
+
+  1) Back up to a DIFFERENT location (recommended)
+     another disk/mount on this server, or a remote server over SSH
+  2) Back up on THIS server
+     fast, but lost if this disk or server fails
+  3) I already have a snapshot/backup (e.g. a VPS snapshot) I can restore
+  4) No backup needed (test server, nothing important)
+  5) Cancel the upgrade
+EOF
+    read -r -p "Choose 1-5: " choice || return 1
+    case "$choice" in
+      1)
+        read -r -p "Mounted directory (e.g. /mnt/backup) or remote user@host:/path: " dest || return 1
+        if [[ $dest =~ $re_remote ]]; then
+          backup_remote "$dest" && return 0
+        else
+          backup_local "$dest" different && return 0
+        fi ;;
+      2)
+        read -r -p "Directory on this server [/var/backups/linux-autoupdate]: " dest || return 1
+        backup_local "${dest:-/var/backups/linux-autoupdate}" same && {
+          echo "Note: this backup is on the same server. It protects against a failed upgrade, not against disk or server loss."
+          return 0
+        } ;;
+      3)
+        if ask_yn "Do you have a recent snapshot/backup stored outside this server's disk, and can you restore it?" n; then
+          BACKUP_LOCATION="existing snapshot/backup (confirmed by user)"
+          return 0
+        fi ;;
+      4)
+        echo "Without a backup, a failed upgrade can mean data loss."
+        read -r -p 'Type NO BACKUP to continue without one: ' dest || return 1
+        if [[ $dest == "NO BACKUP" ]]; then
+          BACKUP_LOCATION="none (declined by user)"
+          return 0
+        fi ;;
+      5) return 1 ;;
+      *) echo "Please choose 1-5." ;;
+    esac
+  done
+}
+
+# ---- the upgrade itself, with automatic repair ----
+
+do_release_upgrade() {
+  local from=$OS_VERSION_ID attempt rc
+  write_marker
+  echo "release_from=$from" >>"$MARKER"
+  export DEBIAN_FRONTEND=noninteractive
+  for attempt in 1 2 3; do
+    say "Running the release upgrade (attempt $attempt of 3) - this takes a while, please keep this terminal open..."
+    run do-release-upgrade -f DistUpgradeViewNonInteractive
+    rc=$?
+    load_os_release
+    if [[ $OS_VERSION_ID != "$from" ]]; then
+      log "Release changed: $from -> $OS_VERSION_ID (exit $rc)"
+      return 0
+    fi
+    log "Upgrade attempt $attempt ended (exit $rc) without changing the release - repairing and retrying"
+    apt_heal || log "Self-heal could not fully repair the package system"
+  done
+  return 1
+}
+
+release_verify() {
+  local svc line bad=0
+  log "Verifying the upgraded system"
+  if ! apt_health; then
+    apt_heal || bad=1
+  fi
+  # finish anything the upgrade left half-done
+  UPDATE_MODE_EFFECTIVE="all"
+  FAILED=0
+  pm_update
+  (( FAILED )) && bad=1
+  if [[ -f $MARKER ]]; then
+    while IFS= read -r line; do
+      case "$line" in
+        service=*)
+          svc=${line#service=}
+          if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            log "OK: $svc is active"
+          else
+            log "Self-heal: restarting $svc"
+            systemctl restart "$svc" >>"$LOG" 2>&1
+            sleep 3
+            if systemctl is-active --quiet "$svc" 2>/dev/null; then
+              log "OK: $svc recovered after restart"
+            else
+              log "FAILED: $svc is not running after the upgrade"
+              bad=1
+            fi
+          fi ;;
+      esac
+    done <"$MARKER"
+  fi
+  return "$bad"
+}
+
+release_upgrade_flow() {
+  local from_pretty=$OS_PRETTY from_ver=$OS_VERSION_ID
+  release_preflight || return 1
+  backup_flow || { echo "Upgrade cancelled - nothing was changed."; log "Release upgrade cancelled at the backup step"; return 1; }
+  state_set BACKUP_LOCATION "$BACKUP_LOCATION"
+  state_set BACKUP_TIME "$(now)"
+  log "Backup/safety choice: $BACKUP_LOCATION"
+  echo
+  echo "Ready to upgrade $from_pretty to Ubuntu $RELEASE_AVAILABLE."
+  echo "Backup: $BACKUP_LOCATION"
+  ask_yn "Start the upgrade now?" n || { echo "Upgrade cancelled - nothing was changed."; log "Release upgrade cancelled before start"; return 1; }
+
+  log "==== Release upgrade started: $from_pretty -> Ubuntu $RELEASE_AVAILABLE ===="
+  if ! do_release_upgrade; then
+    log "ERROR: the release upgrade did not complete after 3 attempts"
+    state_set LAST_RELEASE_UPGRADE "FAILED $(now)"
+    notify failure "[$(host_name)] linux-autoupdate: release upgrade FAILED" "The upgrade from $from_pretty did not complete. Backup: $BACKUP_LOCATION. Log: $LOG"
+    cat <<EOF
+
+The upgrade did not complete. Automatic repair was tried 3 times.
+ - Details:  $LOG
+ - Backup:   $BACKUP_LOCATION
+ - Try:      dpkg --configure -a && apt-get -f install, then '$PROG release-upgrade' again
+ - To go back, restore from your backup or snapshot (see RESTORE.txt in the backup).
+EOF
+    return 1
+  fi
+  load_os_release
+  if release_verify; then
+    log "SUCCESS: upgraded from $from_pretty ($from_ver) to ${OS_PRETTY:-?}"
+    state_set LAST_RELEASE_UPGRADE "OK $from_ver -> $OS_VERSION_ID $(now)"
+    notify success "[$(host_name)] linux-autoupdate: release upgrade OK" "Upgraded from $from_pretty to $OS_PRETTY. Backup: $BACKUP_LOCATION."
+    echo
+    echo "SUCCESS: the server was upgraded to ${OS_PRETTY:-the new release}. A reboot finishes the upgrade."
+  else
+    log "WARNING: upgraded to ${OS_PRETTY:-?} but some checks failed - see above"
+    state_set LAST_RELEASE_UPGRADE "OK WITH WARNINGS $from_ver -> $OS_VERSION_ID $(now)"
+    notify failure "[$(host_name)] linux-autoupdate: release upgrade finished with problems" "Upgraded to $OS_PRETTY but some checks failed. Log: $LOG. Backup: $BACKUP_LOCATION."
+    echo
+    echo "The upgrade finished, but some checks failed. Please review $LOG before relying on this server."
+  fi
+  state_set RELEASE_AVAILABLE ""
+  if ask_yn "Reboot now to finish the upgrade? (recommended)" y; then
+    log "Rebooting in 1 minute after the release upgrade."
+    shutdown -r +1 "Rebooting to finish the release upgrade" || echo "shutdown failed - please reboot manually."
+  else
+    echo "Please reboot soon. A health check of your web/PHP/database services runs after the next boot."
+  fi
+  return 0
+}
+
+# Explicit, interactive command.
+cmd_release_upgrade() {
+  is_tty || die "release-upgrade asks questions, so it must be run in a terminal. It is never run by the timer or cron."
+  acquire_lock
+  load_os_release
+  [[ $OS_ID == ubuntu ]] || die "release upgrades are supported on Ubuntu only (this is ${OS_PRETTY:-an unknown OS})"
+  detect_pm || die "apt-get not found"
+  if ! command -v do-release-upgrade >/dev/null 2>&1; then
+    echo "do-release-upgrade is not installed (package update-manager-core)."
+    ask_yn "Install it now?" y || exit 1
+    run apt-get install -y update-manager-core || die "could not install update-manager-core"
+  fi
+  say "Checking for a new Ubuntu release..."
+  release_check
+  if [[ -z $RELEASE_AVAILABLE ]]; then
+    echo "No new Ubuntu release is available for ${OS_PRETTY:-this server}."
+    echo "(Release checks follow the Prompt= setting in /etc/update-manager/release-upgrades.)"
+    return 0
+  fi
+  show_release_info
+  if ask_yn "Upgrade to Ubuntu $RELEASE_AVAILABLE now?" n; then
+    release_upgrade_flow
+  else
+    log "Release upgrade declined - staying on ${OS_PRETTY:-the current release} with the latest updates."
+    echo "OK - staying on ${OS_PRETTY:-the current release}. All the latest updates stay installed."
+  fi
+}
+
+# Offered after an interactive update.
+release_offer() {
+  [[ -n $RELEASE_AVAILABLE ]] || return 0
+  is_tty || return 0
+  [[ $REBOOT_NOTE == rebooting ]] && return 0
+  echo
+  if (( REBOOT_PENDING )); then
+    echo "A new Ubuntu release is available ($RELEASE_AVAILABLE), but a reboot is pending."
+    echo "Reboot first, then run '$PROG release-upgrade' to review it."
+    return 0
+  fi
+  if (( UPDATED == 0 )); then
+    echo "No package updates were found, but a new Ubuntu release is available."
+  fi
+  show_release_info
+  if ask_yn "Upgrade to Ubuntu $RELEASE_AVAILABLE now?" n; then
+    release_upgrade_flow
+  else
+    log "Release upgrade declined - staying on ${OS_PRETTY:-the current release} with the latest updates."
+    echo "OK - staying on ${OS_PRETTY:-the current release}. All the latest updates stay installed."
+    echo "You can review the upgrade later with: $PROG release-upgrade"
+  fi
+}
+
 # ------------------------------------------------------------------- main ---
 
 main() {
   parse_args "$@"
-  [[ $EUID -ne 0 ]] && { echo "Run as root."; exit 1; }
+  if [[ $EUID -ne 0 ]]; then
+    if (( RUN_FROM_PIPE )); then
+      echo "Run as root, for example:"
+      echo "  curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v$VERSION/auto-update.sh | sudo bash -s -- ${*:-}"
+      exit 1
+    fi
+    if command -v sudo >/dev/null 2>&1; then
+      echo "Not root - running again with sudo..."
+      exec sudo -- bash "$(readlink -f "$0")" "$@"
+    fi
+    echo "Run as root."
+    exit 1
+  fi
+  # Run as 'curl ... | bash': stdin is the pipe the script came from. Children
+  # must not read it, so point stdin at /dev/null (no prompts are possible).
+  if [[ ! -t 0 ]]; then exec </dev/null; fi
   load_config
   init_log
   case "$CMD" in
@@ -1387,6 +2260,7 @@ main() {
     disable)   cmd_disable ;;
     status)    cmd_status ;;
     uninstall) cmd_uninstall ;;
+    release-upgrade) cmd_release_upgrade ;;
     postboot)  cmd_postboot ;;
     check)     cmd_check ;;
     run)       VERBOSE=0; cmd_update ;;
@@ -1394,7 +2268,9 @@ main() {
   esac
 }
 
-if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+# Run when executed as a file or piped into bash; do nothing when sourced.
+if [[ -z ${BASH_SOURCE[0]:-} ]]; then RUN_FROM_PIPE=1; fi
+if [[ -z ${BASH_SOURCE[0]:-} || ${BASH_SOURCE[0]} == "$0" ]]; then
   main "$@"
   exit $?
 fi
