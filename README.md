@@ -1,10 +1,77 @@
 # linux-autoupdate
 
-A single bash script that detects your Linux distribution, keeps packages up to
-date (kernel and PHP included), and manages the whole job: scheduled runs,
-safe reboots, notifications and a post-reboot health check.
+One command to find and install every update on a Linux server, and one more to
+keep it updated automatically. It detects your distribution, updates the
+kernel, PHP and everything else, repairs common problems on its own, and tells
+you in plain words whether the server is up to date.
 
-Created by Ucartz. Current version: **2.0.0**
+Created by Ucartz. Current version: **2.1.0**
+
+## Quick start
+
+Run as root (or put `sudo` before `bash`). Nothing needs to be installed first.
+
+**Find and install all updates now**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.1.0/auto-update.sh | sudo bash
+```
+
+**Only look, change nothing**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.1.0/auto-update.sh | sudo bash -s -- check
+```
+
+**Install the tool and turn on weekly automatic updates, in one command**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.1.0/auto-update.sh -o /usr/local/sbin/auto-update.sh && chmod +x /usr/local/sbin/auto-update.sh && auto-update.sh install --enable
+```
+
+Other options for the first command: `-- --security` (security updates only),
+`-- --php-only`, `-- --reboot` (reboot if needed). No `curl`? Use
+`wget -qO- <url> | sudo bash` instead. Prefer to read the script first? See
+[Verify the download](#verify-the-download).
+
+### How to read the result
+
+Every run ends with a `STATUS:` line, so there is never a doubt:
+
+| You see | Meaning |
+|---------|---------|
+| `STATUS: UP TO DATE` | Nothing is waiting to be installed. |
+| `STATUS: UPDATES PENDING` | Updates are available (`check` only). Run the command again without `check` to install them. |
+| `STATUS: REBOOT REQUIRED` | Updates are installed, but a reboot is needed to load the new kernel. |
+| `STATUS: CANNOT CONFIRM ...` | The package sources have a problem (unreachable, expired, or the OS release is end-of-life), so "up to date" cannot be trusted. The log line above it says what to fix. |
+| `STATUS: NOT UP TO DATE` | The update failed or was refused. |
+| `NOTE: ... phased rollout` | Ubuntu is releasing a few updates to servers in stages. They install by themselves later; no action needed. |
+
+When a run installs updates it also says
+`SUCCESS: update completed - N package(s) updated to the latest version and fixed (patches applied).`
+or, if there was nothing to do, `Nothing found - no updates available.`
+
+### What it handles for you
+
+| Problem on the server | What the script does |
+|-----------------------|----------------------|
+| Not logged in as root | Re-runs itself with `sudo`, or prints the exact command to use. |
+| Another update holds the package lock (for example Ubuntu's own boot-time updates) | Waits for the lock instead of failing. |
+| Mirror or network hiccup | Retries the package list refresh 3 times. |
+| One dead extra repository (an old PPA) | Continues with the repositories that work and warns about the broken one. |
+| All repositories unreachable | Fails clearly, with a DNS/network hint. Never reports "up to date" by mistake. |
+| Expired repositories or an end-of-life OS release | Warns that the result cannot be trusted and points to the fix. |
+| Interrupted install (half-configured packages) | Repairs the package system before updating. |
+| Update fails part-way | Repairs, then retries once. |
+| Low disk space | Cleans the package cache, then stops with a clear message if there is still not enough room. |
+| Package installs that ask questions | Runs fully non-interactive and keeps existing config files. |
+| SSH connection drops mid-update | The update keeps running. |
+| Two updates started at once | The second waits (when run by hand) or exits (when scheduled). |
+| Ubuntu phased updates | Lists them separately so `check` and the result agree. |
+| A reboot is needed | Says so on the last line; reboots automatically only if you allow it, and only when it is safe. |
+| No systemd | Uses cron (`enable --cron` forces cron anywhere). |
+| No config file | Works with safe defaults; the config is optional. |
+| cPanel / Plesk | Refuses to touch the OS packages and points to the panel's updater. |
 
 ## Supported distributions
 
@@ -19,13 +86,15 @@ The script picks the package manager it finds, in this order:
 | `pacman`        | Arch Linux                                   | no                    |
 | `apk`           | Alpine Linux                                 | no                    |
 
+Snap and Flatpak applications update themselves and are not touched.
+
 ## Install
 
-Run as root. Download the pinned `v2.0.0` release (not the moving `main`
-branch), install it, review the config, then switch the schedule on:
+The quick-start command above installs the pinned `v2.1.0` release and enables
+the schedule. To install without enabling it:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.0.0/auto-update.sh -o /usr/local/sbin/auto-update.sh && chmod +x /usr/local/sbin/auto-update.sh && auto-update.sh install
+curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.1.0/auto-update.sh -o /usr/local/sbin/auto-update.sh && chmod +x /usr/local/sbin/auto-update.sh && auto-update.sh install
 ```
 
 ```sh
@@ -36,22 +105,23 @@ linux-autoupdate enable           # turn on the schedule
 
 `install` copies the script to `/usr/local/sbin/linux-autoupdate`, creates
 `/etc/linux-autoupdate.conf` (if missing), a logrotate rule and the systemd
-units, and leaves auto-updates **disabled** until you run `enable`.
+units, and leaves auto-updates **disabled** until you run `enable` (or use
+`install --enable`).
 
 ### Verify the download
 
-The SHA256 checksum of `auto-update.sh` for v2.0.0 is:
+The SHA256 checksum of `auto-update.sh` for v2.1.0 is:
 
 ```
-c644a5a3a140acf3452e94a7b5772f12829106e8e909db5c08424e8646891667
+a5ad5d6f5cd2d4295ab0c525973bf1072a557024884d1f0fda367fa9383c9156
 ```
 
 To verify, download the script and its checksum file into the same directory
-and check them before installing:
+and check them before running anything:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.0.0/auto-update.sh
-curl -fsSLO https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.0.0/auto-update.sh.sha256
+curl -fsSLO https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.1.0/auto-update.sh
+curl -fsSLO https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.1.0/auto-update.sh.sha256
 sha256sum -c auto-update.sh.sha256
 ```
 
@@ -59,16 +129,17 @@ Expected output: `auto-update.sh: OK`
 
 ## Commands
 
-All commands must be run as root.
+Run as root; as a normal user the script re-runs itself with `sudo`.
 
 | Command             | What it does |
 |---------------------|--------------|
-| `install`           | Copy itself to `/usr/local/sbin/linux-autoupdate`, create the config, logrotate rule and timer. Auto-updates stay disabled. Safe to re-run to upgrade the binary; an existing config is never overwritten. |
-| `enable`            | Enable and start the systemd timer (falls back to a cron entry when systemd is not available). Re-run it after changing `SCHEDULE` or `RANDOM_DELAY`. |
+| `install [--enable [--cron]]` | Copy itself to `/usr/local/sbin/linux-autoupdate`, create the config, logrotate rule and timer. With `--enable` it also turns the schedule on. Safe to re-run to upgrade the binary; an existing config is never overwritten. |
+| `enable [--cron]`   | Enable and start the systemd timer (falls back to a cron entry when systemd is not available; `--cron` forces cron). Re-run it after changing `SCHEDULE` or `RANDOM_DELAY`. |
 | `disable`           | Stop and disable the timer / remove the cron entry. |
-| `status`            | Show enabled/disabled, next scheduled run, last run time and result, pending update count, reboot required yes/no and livepatch status. |
-| `run`               | Perform the updates. Silent, writes to the log only. This is what the timer runs. |
+| `status`            | Show enabled/disabled, next scheduled run, last run time and result, whether the system is up to date, pending update count, reboot required yes/no, release upgrade availability and livepatch status. |
+| `run`               | Perform the updates. Silent, writes to the log only. This is what the timer and cron run. |
 | `check`             | List pending updates and change nothing. |
+| `release-upgrade`   | Ubuntu only: review a new OS release, back up, and upgrade (see below). Interactive. |
 | `uninstall`         | Remove the timer, cron entry, logrotate rule and binary. Config, logs and state are kept unless you add `--purge`. |
 
 The options from version 1 still work as aliases:
@@ -78,23 +149,40 @@ The options from version 1 still work as aliases:
 | *(none)*      | Update everything now, printing progress to the terminal.       |
 | `--check`     | `check`                                                         |
 | `--php-only`  | Update only PHP packages (overrides `UPDATE_MODE` for this run). |
+| `--security`  | Install security updates only (overrides `UPDATE_MODE` for this run). |
 | `--reboot`    | Reboot if a reboot is required (see [Reboots](#reboots)).        |
 | `--version`   | Print the version.                                              |
+
+Every action is logged to `/var/log/auto-update.log` (rotated weekly, 8 kept,
+compressed). The last run is also recorded in
+`/var/lib/linux-autoupdate/state`, which `status` reads.
 
 ### Terminal versus scheduled runs
 
 Run by hand (`linux-autoupdate`, `check`, `status`, ...) the script prints a
 banner, short `==>` progress lines for each step and the command output, and
-ends with a clear result: `SUCCESS: update completed - N package(s) updated.`
-or `Nothing found - no updates available.`
+ends with the `STATUS:` line.
 
 Run by the timer or cron (`run`) it prints nothing and only writes to the log.
 If someone has a terminal open when a scheduled run finishes, a one-line result
 is shown there (`NOTIFY_TERMINALS`).
 
-Every action is logged to `/var/log/auto-update.log` (rotated weekly, 8 kept,
-compressed). The last run is also recorded in
-`/var/lib/linux-autoupdate/state`, which `status` reads.
+## Automatic updates with cron
+
+`enable` uses a systemd timer when systemd is present and cron otherwise.
+To use cron on any system:
+
+```sh
+linux-autoupdate enable --cron
+```
+
+That writes `/etc/cron.d/linux-autoupdate` (or root's crontab on Alpine) with
+your `SCHEDULE`, and an `@reboot` entry for the post-reboot health check. If
+you prefer your own entry, this is all it needs:
+
+```cron
+0 3 * * 0 /usr/local/sbin/linux-autoupdate run
+```
 
 ## Configuration
 
@@ -119,10 +207,12 @@ group/world-writable. The installer creates it with mode `600`.
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | *(empty)* | Telegram notifications. |
 | `ALLOW_ON_PANELS` | `0` | Refuse to update on cPanel/Plesk servers unless set to `1`. |
 | `NOTIFY_TERMINALS` | `1` | After a scheduled run, print the result on any terminal that is open (SSH/console). Nothing is shown when nobody is logged in. |
+| `RELEASE_UPGRADE_CHECK` | `1` | Check for a new Ubuntu release after each run and report it. It is never installed automatically. |
+| `BACKUP_PATHS` | `/etc /var/www /home /root /var/spool/cron /opt /srv` | What to back up when you choose a backup before a release upgrade. |
 
 ### Security-only updates
 
-`UPDATE_MODE="security"` installs only security updates:
+`UPDATE_MODE="security"` (or `--security` for one run) installs only security updates:
 
 - **apt:** packages whose update comes from the distribution's security
   pocket (for example `jammy-security`, `stable-security`).
@@ -171,27 +261,65 @@ parsed from `needs-restarting -r` and is best effort.
 
 Before it reboots, the script records which of nginx, Apache (`apache2` /
 `httpd`), PHP-FPM and MySQL/MariaDB were running. After boot, a small systemd
-service checks that they are active again (waiting up to two minutes), logs the
-result, sends a notification according to `NOTIFY`, and removes the marker. Under
-cron, an `@reboot` entry does the same.
+service checks that they are active again (waiting up to two minutes), restarts
+any that are not once, logs the result, sends a notification according to
+`NOTIFY`, and removes the marker. Under cron, an `@reboot` entry does the same.
 
-## Weekly updates
+## Release upgrades (Ubuntu)
 
-The timer installed by `enable` does this for you. If you prefer your own cron
-entry, run the silent command:
+When Ubuntu offers a new release, for example the `26.04.1 LTS` notice shown at
+login, every run reports it: in the log, in `status`, and on any open terminal.
+The upgrade itself is **never** started by the timer or cron, because it needs
+a person to decide and to watch.
 
-```cron
-0 3 * * 0 /usr/local/sbin/linux-autoupdate run
+In a terminal, after an update (or when nothing needed updating), the script
+shows the pros and cons and asks:
+
+- **yes** - continue to the safe upgrade process below;
+- **no** (the default) - nothing changes; you keep the current release with all
+  the latest updates installed.
+
+You can also start it yourself at any time:
+
+```sh
+linux-autoupdate release-upgrade
 ```
 
-## Upgrading from version 1
+**The safe process**
+
+1. Safety checks, each shown as `[ ok ]`, `[warn]` or `[FAIL]`: no cPanel/Plesk,
+   system fully updated, package system healthy (repaired if not), no reboot
+   pending, no held packages, enough disk space, third-party repositories,
+   and whether you are on SSH outside tmux/screen. A `[FAIL]` stops the upgrade.
+2. Backup. You choose:
+   1. a **different location** (recommended): a separate disk/mount, or a remote
+      server over SSH (`user@host:/path`);
+   2. **this server** (quick, but lost if the disk or server fails);
+   3. an **existing snapshot/backup** you confirm you can restore;
+   4. **no backup needed** (you must type `NO BACKUP`);
+   5. cancel.
+   A backup contains the paths in `BACKUP_PATHS`, MySQL/MariaDB and PostgreSQL
+   dumps when those are running, package lists, checksums and a `RESTORE.txt`.
+   It is verified before the upgrade starts.
+3. A final confirmation, then the upgrade runs with automatic repair: if it is
+   interrupted, the package system is repaired and the upgrade is retried (up to
+   3 attempts).
+4. Afterwards the script checks the package system, finishes anything left
+   half-done, and restarts any web/PHP/database service that is not running.
+   It then offers a reboot; a health check runs after boot.
+
+A release upgrade cannot be rolled back; if it fails, the only way back is
+your backup or snapshot, and the script tells you where it is. Other
+distributions are not supported by this command yet.
+
+## Upgrading from earlier versions
 
 Run the install command above. `install` replaces `/usr/local/sbin/auto-update.sh`
 with a symlink to `/usr/local/sbin/linux-autoupdate` when it is an unmodified
 copy of the downloaded script, so existing cron entries keep working. Version
 1.0.0 stays available at the `v1.0.0` tag.
 
-Behaviour changes to be aware of:
+Behaviour changes since version 1:
 
 - On **cPanel / Plesk** the script now refuses to update unless
   `ALLOW_ON_PANELS=1` is set (`check` and `status` still work). Version 1 only
@@ -205,9 +333,10 @@ Behaviour changes to be aware of:
 
 - **Kernel updates need a reboot.** Without a reboot (or an active livepatch) the
   new kernel is not loaded.
-- **No major upgrades.** The script installs the updates available within your
-  current release. It does not move PHP to a new minor/major version (for
-  example 8.3 to 8.4) or upgrade the OS to a new release.
+- **Updates, not upgrades.** The normal run installs the updates available within
+  your current OS release. It does not move PHP to a new minor/major version
+  (for example 8.3 to 8.4) and does not change the OS release; on Ubuntu that
+  is the separate, confirmed `release-upgrade` command.
 - **cPanel / Plesk servers:** use the panel's own updater (`/scripts/upcp` for
   cPanel, `plesk installer update` for Plesk).
 - The script holds a lock, so two runs never overlap.
