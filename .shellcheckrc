@@ -1,0 +1,5 @@
+# SC1091: /etc/os-release is sourced at runtime and does not exist in CI
+# SC2012: ls piped to sort -V is intentional for kernel version ordering
+# SC2015: the "A && B || C" ionCube note is intentional and only logs
+# SC2046: the unquoted apk package list must word-split into separate arguments
+disable=SC1091,SC2012,SC2015,SC2046
