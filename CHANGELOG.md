@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.3.0] - 2026-10-23
+
+### Added
+- Container-host protection: when Docker has running containers and
+  `live-restore` is off, Docker engine updates (`docker-ce`, `docker.io`,
+  `containerd.io`...) are listed under "DOCKER ENGINE" in the heads-up and held
+  back in scheduled runs, because updating them restarts every container. In a
+  terminal you are asked (default no). `--allow-risky` (alias of `--allow-major`)
+  installs them.
+- On those hosts OS updates run with `needrestart` in list-only mode and the
+  services still using old libraries are listed, instead of being restarted
+  automatically.
+- AzuraCast detection: reminds you that its data lives in Docker volumes outside
+  this tool's backup and points to `./docker.sh backup`; the release-upgrade
+  safety checks warn about running containers and AzuraCast.
+
+### Changed
+- The status wording for held updates is now "RISKY UPDATE(S) HELD BACK" because
+  it covers both major-version changes and Docker engine updates.
+
 ## [2.2.0] - 2026-10-23
 
 ### Added
