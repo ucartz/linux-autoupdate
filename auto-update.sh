@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 PROG="linux-autoupdate"
 BIN="/usr/local/sbin/linux-autoupdate"
 LEGACY_BIN="/usr/local/sbin/auto-update.sh"
@@ -81,6 +81,10 @@ ALLOW_MAJOR=0
 MAJOR_HELD=""
 MAJOR_HELD_DETAIL=""
 MAJOR_BLOCKED=0
+CONTAINERS_CHECKED=0
+CONTAINERS_RUNNING=0
+DOCKER_LIVE_RESTORE=0
+AZURACAST=0
 LOG_START=0
 REFRESH_FAILED=0
 REPO_PROBLEM=""
@@ -182,8 +186,10 @@ Legacy options (still supported):
   --check          same as 'check'
   --php-only       update only PHP packages
   --security       security updates only (apt, dnf, yum, zypper)
-  --allow-major    also install major-version updates of PHP, databases, web
-                   servers, OpenSSL... (otherwise they are asked about or held back)
+  --allow-major    also install risky updates (major-version changes of PHP,
+                   databases, web servers, OpenSSL... and Docker engine updates
+                   that would restart running containers); otherwise they are
+                   asked about or held back   (alias: --allow-risky)
   --backup         back up (external server, other disk or this server) first
   --reboot         reboot automatically if a reboot is required
   --version        print the version
@@ -203,7 +209,7 @@ parse_args() {
       --check)    LEGACY_CHECK=1 ;;
       --php-only) MODE_OVERRIDE="php" ;;
       --security) MODE_OVERRIDE="security" ;;
-      --allow-major) ALLOW_MAJOR=1 ;;
+      --allow-major|--allow-risky) ALLOW_MAJOR=1 ;;
       --backup)   FLAG_BACKUP=1 ;;
       --reboot)   FLAG_REBOOT=1 ;;
       --purge)    PURGE=1 ;;
@@ -957,6 +963,7 @@ pm_update() {
   case "$PM" in
     apt)
       export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none UCF_FORCE_CONFFOLD=1
+      if container_guard; then export NEEDRESTART_MODE=l; fi
       local APT_OPTS=(-y "${APT_NET[@]}" -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
       case "$UPDATE_MODE_EFFECTIVE" in
         php)
@@ -1121,7 +1128,7 @@ finish_run() {
         report_repo_problems
         log "STATUS: CANNOT CONFIRM THE SYSTEM IS UP TO DATE - fix the package source problem above."
       elif [[ -n $MAJOR_HELD ]]; then
-        log "STATUS: UPDATED, BUT MAJOR UPDATE(S) HELD BACK FOR YOUR REVIEW (with anything that depends on them): $MAJOR_HELD_DETAIL"
+        log "STATUS: UPDATED, BUT RISKY UPDATE(S) HELD BACK FOR YOUR REVIEW (with anything that depends on them): $MAJOR_HELD_DETAIL"
         log "        Install them when you are ready (after a backup): $PROG --allow-major --backup"
       elif (( PENDING_AFTER > 0 )); then
         log "STATUS: $PENDING_AFTER UPDATE(S) STILL PENDING - run it again or see $LOG."
@@ -1160,7 +1167,7 @@ New Ubuntu release available: $RELEASE_AVAILABLE (run: $PROG release-upgrade)}
 Log: $LOG"
   if [[ -n $MAJOR_HELD ]]; then
     body+="
-HELD BACK (major-version update, needs your review): $MAJOR_HELD_DETAIL
+HELD BACK (risky update, needs your review): $MAJOR_HELD_DETAIL
 Install after a backup with: $PROG --allow-major --backup"
   fi
   if [[ -n $BACKUP_LOCATION ]]; then
@@ -1255,21 +1262,24 @@ cmd_update() {
     if is_tty; then
       show_risk
     else
-      log "Heads-up: ${#RISK_MAJOR[@]} major-version update(s), ${#RISK_REVIEW[@]} service-package update(s), ${#RISK_KERNEL[@]} kernel update(s) pending."
+      log "Heads-up: ${#RISK_MAJOR[@]} major-version update(s), ${#RISK_RESTART[@]} Docker engine update(s), ${#RISK_REVIEW[@]} service-package update(s), ${#RISK_KERNEL[@]} kernel update(s) pending."
     fi
   fi
-  if [[ ${#RISK_MAJOR[@]} -gt 0 ]]; then
+  if [[ ${#RISK_HOLD[@]} -gt 0 ]]; then
     if (( ALLOW_MAJOR )) || [[ $MAJOR_UPDATES == allow ]]; then
-      log "WARNING: installing major-version update(s) (allowed): ${RISK_MAJOR[*]}"
+      log "WARNING: installing risky update(s) (allowed): ${RISK_HOLD[*]}"
       major_kind=major
-    elif is_tty && ask_yn "Install the major-version update(s) as well?" n; then
-      log "Major-version update(s) approved by the user: ${RISK_MAJOR[*]}"
+    elif is_tty && ask_yn "Install the risky update(s) above as well?" n; then
+      log "Risky update(s) approved by the user: ${RISK_HOLD[*]}"
       major_kind=major
     else
       MAJOR_HELD="${RISK_MAJOR_NAMES[*]}"
-      MAJOR_HELD_DETAIL="${RISK_MAJOR[*]}"
-      log "WARNING: ${#RISK_MAJOR[@]} major-version update(s) held back for your review: $MAJOR_HELD_DETAIL"
+      MAJOR_HELD_DETAIL="${RISK_HOLD[*]}"
+      log "WARNING: ${#RISK_HOLD[@]} risky update(s) held back for your review: $MAJOR_HELD_DETAIL"
     fi
+  fi
+  if (( AZURACAST )); then
+    log "NOTE: AzuraCast detected - its data lives in Docker volumes (not in this tool's backup). Back it up with: cd /var/azuracast && ./docker.sh backup"
   fi
 
   setup_exclusions
@@ -1306,6 +1316,7 @@ cmd_update() {
   fi
   after=$(pending_count 0)
   PENDING_AFTER=$after
+  if [[ $PM == apt ]] && container_guard; then report_needrestart; fi
   count_deferred
   release_exclusions
   UPDATED=$(( before - after ))
@@ -1383,8 +1394,8 @@ cmd_check() {
   pm_check
   assess_risk 1
   show_risk
-  if [[ ${#RISK_MAJOR[@]} -gt 0 ]]; then
-    log "WARNING: ${#RISK_MAJOR[@]} major-version update(s) need your review. Scheduled runs hold them back; install with: $PROG --allow-major --backup"
+  if [[ ${#RISK_HOLD[@]} -gt 0 ]]; then
+    log "WARNING: ${#RISK_HOLD[@]} risky update(s) need your review. Scheduled runs hold them back; install with: $PROG --allow-major --backup"
   fi
   total=$(pending_count 0)
   count_deferred
@@ -1816,6 +1827,51 @@ cmd_status() {
 
 KERNEL_GLOBS="linux-image* linux-modules* kernel kernel-core kernel-modules* kernel-default kernel-lt kernel-ml linux linux-lts linux-hardened linux-zen"
 
+DOCKER_ENGINE_GLOBS="docker-ce docker.io docker-engine moby-engine containerd.io containerd"
+
+# Docker / AzuraCast detection. Updating the Docker engine restarts the Docker
+# daemon, which stops every running container unless live-restore is enabled.
+detect_containers() {
+  CONTAINERS_CHECKED=1
+  CONTAINERS_RUNNING=0
+  DOCKER_LIVE_RESTORE=0
+  AZURACAST=0
+  if [[ -f /var/azuracast/docker.sh || -f /var/azuracast/docker-compose.yml ]]; then AZURACAST=1; fi
+  command -v docker >/dev/null 2>&1 || return 0
+  CONTAINERS_RUNNING=$(timeout 15 docker ps -q 2>/dev/null | grep -c .)
+  if grep -qE '"live-restore"[[:space:]]*:[[:space:]]*true' /etc/docker/daemon.json 2>/dev/null; then
+    DOCKER_LIVE_RESTORE=1
+  fi
+  if (( ! AZURACAST )) && timeout 15 docker ps --format '{{.Names}}' 2>/dev/null | grep -qi '^azuracast'; then
+    AZURACAST=1
+  fi
+  return 0
+}
+
+# True when updating the Docker engine would interrupt running containers.
+container_guard() {
+  (( CONTAINERS_CHECKED )) || detect_containers
+  (( CONTAINERS_RUNNING > 0 && ! DOCKER_LIVE_RESTORE ))
+}
+
+azuracast_note() {
+  (( CONTAINERS_CHECKED )) || detect_containers
+  (( AZURACAST )) || return 0
+  echo "  AzuraCast detected: its station data lives in Docker volumes, which are NOT part of"
+  echo "  this tool's file backup. Back it up with: cd /var/azuracast && ./docker.sh backup"
+  echo "  (or take a server snapshot). Update AzuraCast itself with ./docker.sh update."
+}
+
+# After an apt update on a container host: list services still running old
+# libraries instead of restarting them behind your back.
+report_needrestart() {
+  local svcs
+  command -v needrestart >/dev/null 2>&1 || return 0
+  svcs=$(needrestart -b -r l 2>/dev/null | sed -n 's/^NEEDRESTART-SVC: //p' | tr '\n' ' ')
+  [[ -n $svcs ]] || return 0
+  log "NOTE: services still running old libraries (restart them in a quiet moment, or reboot): ${svcs% }"
+}
+
 # Print "name<TAB>installed<TAB>new" for every package that would be updated.
 pending_list() {
   local cached=${1:-0} opt=() out line n old
@@ -1875,6 +1931,8 @@ RISK_MAJOR=()
 RISK_MAJOR_NAMES=()
 RISK_REVIEW=()
 RISK_KERNEL=()
+RISK_RESTART=()
+RISK_HOLD=()
 
 assess_risk() {
   local name old new a b seen="|"
@@ -1882,6 +1940,9 @@ assess_risk() {
   RISK_MAJOR_NAMES=()
   RISK_REVIEW=()
   RISK_KERNEL=()
+  RISK_RESTART=()
+  RISK_HOLD=()
+  detect_containers
   read -ra EXCL <<<"$EXCLUDE_PACKAGES"
   while IFS=$'\t' read -r name old new; do
     [[ -n $name && $old != "-" ]] || continue
@@ -1890,6 +1951,11 @@ assess_risk() {
     excl_match "$name" && continue
     if glob_match "$name" "$KERNEL_GLOBS"; then
       RISK_KERNEL+=("$name  $old -> $new")
+      continue
+    fi
+    if container_guard && glob_match "$name" "$DOCKER_ENGINE_GLOBS"; then
+      RISK_RESTART+=("$name  $old -> $new")
+      RISK_MAJOR_NAMES+=("$name")
       continue
     fi
     glob_match "$name" "$RISK_PACKAGES" || continue
@@ -1902,9 +1968,10 @@ assess_risk() {
       RISK_REVIEW+=("$name  $old -> $new")
     fi
   done < <(pending_list "${1:-0}")
+  RISK_HOLD=(${RISK_MAJOR[@]+"${RISK_MAJOR[@]}"} ${RISK_RESTART[@]+"${RISK_RESTART[@]}"})
 }
 
-risk_found() { (( ${#RISK_MAJOR[@]} + ${#RISK_REVIEW[@]} + ${#RISK_KERNEL[@]} > 0 )); }
+risk_found() { (( ${#RISK_MAJOR[@]} + ${#RISK_RESTART[@]} + ${#RISK_REVIEW[@]} + ${#RISK_KERNEL[@]} > 0 )); }
 
 print_risk_group() {  # title, then lines
   local title=$1 shown=0 l
@@ -1923,6 +1990,10 @@ show_risk() {
   echo "Heads-up - review before installing:"
   if [[ ${#RISK_MAJOR[@]} -gt 0 ]]; then
     print_risk_group "MAJOR VERSION CHANGE (can change behaviour or break apps):" "${RISK_MAJOR[@]}"
+  fi
+  if [[ ${#RISK_RESTART[@]} -gt 0 ]]; then
+    print_risk_group "DOCKER ENGINE (restarts ALL $CONTAINERS_RUNNING running container(s); live-restore is off):" "${RISK_RESTART[@]}"
+    azuracast_note
   fi
   if [[ ${#RISK_REVIEW[@]} -gt 0 ]]; then
     print_risk_group "Service packages, same major version (services may restart briefly):" "${RISK_REVIEW[@]}"
@@ -2159,6 +2230,14 @@ release_preflight() {
     fi
   fi
 
+  detect_containers
+  if (( CONTAINERS_RUNNING > 0 )); then
+    pf warn "$CONTAINERS_RUNNING Docker container(s) are running; the upgrade restarts Docker, so they stop for a while"
+  fi
+  if (( AZURACAST )); then
+    pf warn "AzuraCast detected: its data is in Docker volumes, not in this tool's backup. Run 'cd /var/azuracast && ./docker.sh backup' first, and expect the streams to drop during the upgrade"
+  fi
+
   n=$(third_party_sources | wc -l)
   if (( n > 0 )); then
     pf warn "$n third-party apt source line(s) found; the upgrade will disable them"
@@ -2340,6 +2419,7 @@ backup_flow() {
   local choice dest reason=${1:-"this change cannot easily be undone"}
   echo
   echo "Data safety - $reason, so back up first."
+  azuracast_note
   while true; do
     cat <<'EOF'
 
