@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.2.0] - 2026-10-23
+
+### Added
+- Risk review before installing: updates to sensitive packages (kernel, PHP,
+  MySQL/MariaDB/PostgreSQL, nginx, Apache, OpenSSL, libc, container runtimes,
+  see `RISK_PACKAGES`) are listed in a "Heads-up" block in `check`, in terminal
+  runs and in the log. A change of `major.minor` version counts as a major
+  update.
+- Major updates are asked about in a terminal (default no) and held back in
+  scheduled runs and piped one-liners; the rest still installs and a
+  notification is sent. `--allow-major` or `MAJOR_UPDATES="allow"` installs them.
+  `status` shows what is held back.
+- Backup before updating: `--backup`, `BACKUP_BEFORE_UPDATE` (`no`, `major`,
+  `always`), `BACKUP_DESTINATION` and `BACKUP_KEEP`. Destinations are an
+  external server over SSH key login, a directory on another disk, or this
+  server. If a requested backup fails, no updates are installed.
+- The backup menu now lists external server, different disk and same server as
+  separate choices, and is shared by updates and the Ubuntu release upgrade.
+- `check` reports when the server already needs a reboot.
+
+### Fixed
+- Installed versions of packages with several installed copies (for example
+  `glibc` i686 + x86_64, or several kernels) are read correctly.
+
 ## [2.1.0] - 2026-10-23
 
 ### Added
