@@ -5,7 +5,7 @@ keep it updated automatically. It detects your distribution, updates the
 kernel, PHP and everything else, repairs common problems on its own, and tells
 you in plain words whether the server is up to date.
 
-Created by Ucartz. Current version: **2.1.0**
+Created by Ucartz. Current version: **2.2.0**
 
 ## Quick start
 
@@ -14,23 +14,24 @@ Run as root (or put `sudo` before `bash`). Nothing needs to be installed first.
 **Find and install all updates now**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.1.0/auto-update.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.2.0/auto-update.sh | sudo bash
 ```
 
 **Only look, change nothing**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.1.0/auto-update.sh | sudo bash -s -- check
+curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.2.0/auto-update.sh | sudo bash -s -- check
 ```
 
 **Install the tool and turn on weekly automatic updates, in one command**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.1.0/auto-update.sh -o /usr/local/sbin/auto-update.sh && chmod +x /usr/local/sbin/auto-update.sh && auto-update.sh install --enable
+curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.2.0/auto-update.sh -o /usr/local/sbin/auto-update.sh && chmod +x /usr/local/sbin/auto-update.sh && auto-update.sh install --enable
 ```
 
 Other options for the first command: `-- --security` (security updates only),
-`-- --php-only`, `-- --reboot` (reboot if needed). No `curl`? Use
+`-- --php-only`, `-- --reboot` (reboot if needed), `-- --allow-major` (also
+install major-version updates) and `-- --backup` (back up first). No `curl`? Use
 `wget -qO- <url> | sudo bash` instead. Prefer to read the script first? See
 [Verify the download](#verify-the-download).
 
@@ -42,6 +43,7 @@ Every run ends with a `STATUS:` line, so there is never a doubt:
 |---------|---------|
 | `STATUS: UP TO DATE` | Nothing is waiting to be installed. |
 | `STATUS: UPDATES PENDING` | Updates are available (`check` only). Run the command again without `check` to install them. |
+| `STATUS: UPDATED, BUT MAJOR UPDATE(S) HELD BACK ...` | Everything else was installed, but a major-version change to a sensitive package (database, PHP, web server, OpenSSL...) was held back for your review. See [Major updates](#major-updates-and-backups). |
 | `STATUS: REBOOT REQUIRED` | Updates are installed, but a reboot is needed to load the new kernel. |
 | `STATUS: CANNOT CONFIRM ...` | The package sources have a problem (unreachable, expired, or the OS release is end-of-life), so "up to date" cannot be trusted. The log line above it says what to fix. |
 | `STATUS: NOT UP TO DATE` | The update failed or was refused. |
@@ -55,6 +57,8 @@ or, if there was nothing to do, `Nothing found - no updates available.`
 
 | Problem on the server | What the script does |
 |-----------------------|----------------------|
+| A risky major-version update (for example MariaDB 10.6 to 10.11, PHP 8.3 to 8.4) | Shows a heads-up. In a terminal it asks; in scheduled runs it holds that package back, installs the rest and notifies you. |
+| You want a safety net | Offers a backup before major updates (external server over SSH, another disk, or this server), and can back up before every run. If a requested backup fails, no updates are installed. |
 | Not logged in as root | Re-runs itself with `sudo`, or prints the exact command to use. |
 | Another update holds the package lock (for example Ubuntu's own boot-time updates) | Waits for the lock instead of failing. |
 | Mirror or network hiccup | Retries the package list refresh 3 times. |
@@ -90,11 +94,11 @@ Snap and Flatpak applications update themselves and are not touched.
 
 ## Install
 
-The quick-start command above installs the pinned `v2.1.0` release and enables
+The quick-start command above installs the pinned `v2.2.0` release and enables
 the schedule. To install without enabling it:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.1.0/auto-update.sh -o /usr/local/sbin/auto-update.sh && chmod +x /usr/local/sbin/auto-update.sh && auto-update.sh install
+curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.2.0/auto-update.sh -o /usr/local/sbin/auto-update.sh && chmod +x /usr/local/sbin/auto-update.sh && auto-update.sh install
 ```
 
 ```sh
@@ -110,18 +114,18 @@ units, and leaves auto-updates **disabled** until you run `enable` (or use
 
 ### Verify the download
 
-The SHA256 checksum of `auto-update.sh` for v2.1.0 is:
+The SHA256 checksum of `auto-update.sh` for v2.2.0 is:
 
 ```
-a5ad5d6f5cd2d4295ab0c525973bf1072a557024884d1f0fda367fa9383c9156
+19e13b9816a5943a722da21fdece8d1f14f84c00fcd1656874ac18207ab7dc16
 ```
 
 To verify, download the script and its checksum file into the same directory
 and check them before running anything:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.1.0/auto-update.sh
-curl -fsSLO https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.1.0/auto-update.sh.sha256
+curl -fsSLO https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.2.0/auto-update.sh
+curl -fsSLO https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.2.0/auto-update.sh.sha256
 sha256sum -c auto-update.sh.sha256
 ```
 
@@ -150,6 +154,8 @@ The options from version 1 still work as aliases:
 | `--check`     | `check`                                                         |
 | `--php-only`  | Update only PHP packages (overrides `UPDATE_MODE` for this run). |
 | `--security`  | Install security updates only (overrides `UPDATE_MODE` for this run). |
+| `--allow-major` | Also install major-version updates of sensitive packages (otherwise asked about or held back). |
+| `--backup`    | Back up first: in a terminal you choose the destination; otherwise `BACKUP_DESTINATION` is used. |
 | `--reboot`    | Reboot if a reboot is required (see [Reboots](#reboots)).        |
 | `--version`   | Print the version.                                              |
 
@@ -208,7 +214,46 @@ group/world-writable. The installer creates it with mode `600`.
 | `ALLOW_ON_PANELS` | `0` | Refuse to update on cPanel/Plesk servers unless set to `1`. |
 | `NOTIFY_TERMINALS` | `1` | After a scheduled run, print the result on any terminal that is open (SSH/console). Nothing is shown when nobody is logged in. |
 | `RELEASE_UPGRADE_CHECK` | `1` | Check for a new Ubuntu release after each run and report it. It is never installed automatically. |
-| `BACKUP_PATHS` | `/etc /var/www /home /root /var/spool/cron /opt /srv` | What to back up when you choose a backup before a release upgrade. |
+| `BACKUP_PATHS` | `/etc /var/www /home /root /var/spool/cron /opt /srv` | What a backup contains. |
+| `MAJOR_UPDATES` | `hold` | `hold`: ask in a terminal, hold back in scheduled runs. `allow`: install major-version updates (a warning is still logged). |
+| `RISK_PACKAGES` | PHP, MySQL/MariaDB/PostgreSQL, nginx, Apache, OpenSSL, libc, Docker/Podman, Redis, MongoDB, OpenSSH... | Packages treated as sensitive (globs). |
+| `BACKUP_BEFORE_UPDATE` | `no` | `no`, `major` (before major-version updates) or `always` (before every run that has updates). |
+| `BACKUP_DESTINATION` | *(empty)* | Where unattended backups go: `user@host:/path` (SSH key login), a directory on another disk, or empty for `/var/backups/linux-autoupdate` on this server. |
+| `BACKUP_KEEP` | `3` | Keep this many backups in the destination (`0` keeps all). |
+
+### Major updates and backups
+
+Before installing, the script looks at the pending updates. Packages that can
+change how a server behaves (the kernel, PHP, databases, web servers, OpenSSL,
+libc, container runtimes... see `RISK_PACKAGES`) are listed under
+**Heads-up - review before installing**:
+
+- **Major version change** (the `major.minor` version changes, e.g. MariaDB
+  10.6 to 10.11): in a terminal you are asked whether to install it, with
+  *no* as the default. In a scheduled run or a piped one-liner it is **held
+  back**, the other updates install, and you are notified. Install it later with
+  `linux-autoupdate --allow-major --backup`, or set `MAJOR_UPDATES="allow"`.
+- **Same major version** (patch-level): listed so you know services may restart.
+- **Kernel**: listed; a reboot is needed to use it.
+
+**Backup options.** When you agree to a major update (or use `--backup`), you
+choose where the backup goes:
+
+1. an **external server** over SSH (`user@host:/path`), recommended;
+2. a **different disk or mount** on this server;
+3. **this server**, same disk (quick, but lost if the disk or server fails);
+4. an existing **snapshot** you confirm you can restore;
+5. **no backup** (you must type `NO BACKUP`);
+6. cancel.
+
+For unattended runs set `BACKUP_BEFORE_UPDATE` (`major` or `always`) and
+`BACKUP_DESTINATION`. External servers need SSH **key** login and must already be
+in `known_hosts` (run `ssh user@host` once by hand). If a requested backup fails,
+**no updates are installed** and you are notified. Each backup holds the files in
+`BACKUP_PATHS`, MySQL/MariaDB and PostgreSQL dumps when those are running,
+package lists, checksums and a `RESTORE.txt`, and is verified before updating.
+Old backups beyond `BACKUP_KEEP` are removed from the destination (only the ones
+this tool created).
 
 ### Security-only updates
 
@@ -292,12 +337,12 @@ linux-autoupdate release-upgrade
    pending, no held packages, enough disk space, third-party repositories,
    and whether you are on SSH outside tmux/screen. A `[FAIL]` stops the upgrade.
 2. Backup. You choose:
-   1. a **different location** (recommended): a separate disk/mount, or a remote
-      server over SSH (`user@host:/path`);
-   2. **this server** (quick, but lost if the disk or server fails);
-   3. an **existing snapshot/backup** you confirm you can restore;
-   4. **no backup needed** (you must type `NO BACKUP`);
-   5. cancel.
+   1. an **external server** over SSH (`user@host:/path`), recommended;
+   2. a **different disk or mount** on this server;
+   3. **this server**, same disk (quick, but lost if the disk or server fails);
+   4. an **existing snapshot/backup** you confirm you can restore;
+   5. **no backup needed** (you must type `NO BACKUP`);
+   6. cancel.
    A backup contains the paths in `BACKUP_PATHS`, MySQL/MariaDB and PostgreSQL
    dumps when those are running, package lists, checksums and a `RESTORE.txt`.
    It is verified before the upgrade starts.
