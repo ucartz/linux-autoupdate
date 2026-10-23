@@ -5,7 +5,7 @@ keep it updated automatically. It detects your distribution, updates the
 kernel, PHP and everything else, repairs common problems on its own, and tells
 you in plain words whether the server is up to date.
 
-Created by Ucartz. Current version: **2.2.0**
+Created by Ucartz. Current version: **2.3.0**
 
 ## Quick start
 
@@ -14,24 +14,24 @@ Run as root (or put `sudo` before `bash`). Nothing needs to be installed first.
 **Find and install all updates now**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.2.0/auto-update.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.3.0/auto-update.sh | sudo bash
 ```
 
 **Only look, change nothing**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.2.0/auto-update.sh | sudo bash -s -- check
+curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.3.0/auto-update.sh | sudo bash -s -- check
 ```
 
 **Install the tool and turn on weekly automatic updates, in one command**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.2.0/auto-update.sh -o /usr/local/sbin/auto-update.sh && chmod +x /usr/local/sbin/auto-update.sh && auto-update.sh install --enable
+curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.3.0/auto-update.sh -o /usr/local/sbin/auto-update.sh && chmod +x /usr/local/sbin/auto-update.sh && auto-update.sh install --enable
 ```
 
 Other options for the first command: `-- --security` (security updates only),
 `-- --php-only`, `-- --reboot` (reboot if needed), `-- --allow-major` (also
-install major-version updates) and `-- --backup` (back up first). No `curl`? Use
+install risky updates; alias `--allow-risky`) and `-- --backup` (back up first). No `curl`? Use
 `wget -qO- <url> | sudo bash` instead. Prefer to read the script first? See
 [Verify the download](#verify-the-download).
 
@@ -43,7 +43,7 @@ Every run ends with a `STATUS:` line, so there is never a doubt:
 |---------|---------|
 | `STATUS: UP TO DATE` | Nothing is waiting to be installed. |
 | `STATUS: UPDATES PENDING` | Updates are available (`check` only). Run the command again without `check` to install them. |
-| `STATUS: UPDATED, BUT MAJOR UPDATE(S) HELD BACK ...` | Everything else was installed, but a major-version change to a sensitive package (database, PHP, web server, OpenSSL...) was held back for your review. See [Major updates](#major-updates-and-backups). |
+| `STATUS: UPDATED, BUT RISKY UPDATE(S) HELD BACK ...` | Everything else was installed, but a risky update was held back for your review: a major-version change to a sensitive package (database, PHP, web server, OpenSSL...) or a Docker engine update that would restart your running containers. See [Major updates](#major-updates-and-backups) and [Servers running Docker](#servers-running-docker-and-azuracast). |
 | `STATUS: REBOOT REQUIRED` | Updates are installed, but a reboot is needed to load the new kernel. |
 | `STATUS: CANNOT CONFIRM ...` | The package sources have a problem (unreachable, expired, or the OS release is end-of-life), so "up to date" cannot be trusted. The log line above it says what to fix. |
 | `STATUS: NOT UP TO DATE` | The update failed or was refused. |
@@ -57,6 +57,7 @@ or, if there was nothing to do, `Nothing found - no updates available.`
 
 | Problem on the server | What the script does |
 |-----------------------|----------------------|
+| A Docker engine update on a server with running containers (it restarts all of them) | Holds it back in scheduled runs and tells you; asks in a terminal. Never restarts Docker behind your back. |
 | A risky major-version update (for example MariaDB 10.6 to 10.11, PHP 8.3 to 8.4) | Shows a heads-up. In a terminal it asks; in scheduled runs it holds that package back, installs the rest and notifies you. |
 | You want a safety net | Offers a backup before major updates (external server over SSH, another disk, or this server), and can back up before every run. If a requested backup fails, no updates are installed. |
 | Not logged in as root | Re-runs itself with `sudo`, or prints the exact command to use. |
@@ -94,11 +95,11 @@ Snap and Flatpak applications update themselves and are not touched.
 
 ## Install
 
-The quick-start command above installs the pinned `v2.2.0` release and enables
+The quick-start command above installs the pinned `v2.3.0` release and enables
 the schedule. To install without enabling it:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.2.0/auto-update.sh -o /usr/local/sbin/auto-update.sh && chmod +x /usr/local/sbin/auto-update.sh && auto-update.sh install
+curl -fsSL https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.3.0/auto-update.sh -o /usr/local/sbin/auto-update.sh && chmod +x /usr/local/sbin/auto-update.sh && auto-update.sh install
 ```
 
 ```sh
@@ -114,18 +115,18 @@ units, and leaves auto-updates **disabled** until you run `enable` (or use
 
 ### Verify the download
 
-The SHA256 checksum of `auto-update.sh` for v2.2.0 is:
+The SHA256 checksum of `auto-update.sh` for v2.3.0 is:
 
 ```
-19e13b9816a5943a722da21fdece8d1f14f84c00fcd1656874ac18207ab7dc16
+af3cc73c83998491280718eb207d8e29f1bd5a0006c42ee79b3a5d66de44b637
 ```
 
 To verify, download the script and its checksum file into the same directory
 and check them before running anything:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.2.0/auto-update.sh
-curl -fsSLO https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.2.0/auto-update.sh.sha256
+curl -fsSLO https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.3.0/auto-update.sh
+curl -fsSLO https://raw.githubusercontent.com/ucartz/linux-autoupdate/v2.3.0/auto-update.sh.sha256
 sha256sum -c auto-update.sh.sha256
 ```
 
@@ -154,7 +155,7 @@ The options from version 1 still work as aliases:
 | `--check`     | `check`                                                         |
 | `--php-only`  | Update only PHP packages (overrides `UPDATE_MODE` for this run). |
 | `--security`  | Install security updates only (overrides `UPDATE_MODE` for this run). |
-| `--allow-major` | Also install major-version updates of sensitive packages (otherwise asked about or held back). |
+| `--allow-major` (or `--allow-risky`) | Also install risky updates: major-version changes of sensitive packages and Docker engine updates that restart running containers (otherwise asked about or held back). |
 | `--backup`    | Back up first: in a terminal you choose the destination; otherwise `BACKUP_DESTINATION` is used. |
 | `--reboot`    | Reboot if a reboot is required (see [Reboots](#reboots)).        |
 | `--version`   | Print the version.                                              |
@@ -254,6 +255,30 @@ in `known_hosts` (run `ssh user@host` once by hand). If a requested backup fails
 package lists, checksums and a `RESTORE.txt`, and is verified before updating.
 Old backups beyond `BACKUP_KEEP` are removed from the destination (only the ones
 this tool created).
+
+### Servers running Docker and AzuraCast
+
+Updating the Docker engine (`docker-ce`, `docker.io`, `containerd.io`...)
+restarts the Docker daemon, which stops **every running container** unless
+`live-restore` is enabled in `/etc/docker/daemon.json`. On a radio server that
+means every stream drops. When containers are running and `live-restore` is off,
+the script therefore:
+
+- lists engine updates under **DOCKER ENGINE** in the heads-up;
+- holds them back in scheduled runs and piped one-liners (the rest still
+  installs and you are notified), and asks in a terminal (default no);
+- installs OS updates in `needrestart` list-only mode, so no service is restarted
+  behind your back, and lists the services still running old libraries so you can
+  restart them in a quiet moment;
+- installs engine updates only with `--allow-risky`, when you choose to.
+
+**AzuraCast** is detected automatically (`/var/azuracast` or an `azuracast`
+container). Its station data lives in Docker volumes, which are **not** part of
+this tool's file backup, so the tool reminds you to back it up with AzuraCast's
+own command (`cd /var/azuracast && ./docker.sh backup`) or a server snapshot
+before risky changes. Update AzuraCast itself with `./docker.sh update`. A
+release upgrade on such a server warns that Docker restarts and the streams
+drop.
 
 ### Security-only updates
 
