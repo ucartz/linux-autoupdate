@@ -13,7 +13,7 @@
 #
 set -uo pipefail
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 PROG="linux-autoupdate"
 BIN="/usr/local/sbin/linux-autoupdate"
 LEGACY_BIN="/usr/local/sbin/auto-update.sh"
@@ -76,6 +76,11 @@ DEFERRED_COUNT=0
 RUN_FROM_PIPE=0
 FLAG_ENABLE=0
 FORCE_CRON=0
+FLAG_BACKUP=0
+ALLOW_MAJOR=0
+MAJOR_HELD=""
+MAJOR_HELD_DETAIL=""
+MAJOR_BLOCKED=0
 LOG_START=0
 REFRESH_FAILED=0
 REPO_PROBLEM=""
@@ -177,6 +182,9 @@ Legacy options (still supported):
   --check          same as 'check'
   --php-only       update only PHP packages
   --security       security updates only (apt, dnf, yum, zypper)
+  --allow-major    also install major-version updates of PHP, databases, web
+                   servers, OpenSSL... (otherwise they are asked about or held back)
+  --backup         back up (external server, other disk or this server) first
   --reboot         reboot automatically if a reboot is required
   --version        print the version
   -h, --help       show this help
@@ -195,6 +203,8 @@ parse_args() {
       --check)    LEGACY_CHECK=1 ;;
       --php-only) MODE_OVERRIDE="php" ;;
       --security) MODE_OVERRIDE="security" ;;
+      --allow-major) ALLOW_MAJOR=1 ;;
+      --backup)   FLAG_BACKUP=1 ;;
       --reboot)   FLAG_REBOOT=1 ;;
       --purge)    PURGE=1 ;;
       --enable)   FLAG_ENABLE=1 ;;
@@ -250,6 +260,11 @@ set_defaults() {
   NOTIFY_TERMINALS=1
   RELEASE_UPGRADE_CHECK=1
   BACKUP_PATHS="/etc /var/www /home /root /var/spool/cron /opt /srv"
+  MAJOR_UPDATES="hold"
+  RISK_PACKAGES="php* ea-php* mysql* mariadb* percona* postgresql* nginx* apache2* httpd* openssl libssl* libc6 glibc docker* containerd* redis* mongodb* openssh-server podman* runc crun conmon"
+  BACKUP_BEFORE_UPDATE="no"
+  BACKUP_DESTINATION=""
+  BACKUP_KEEP=3
 }
 
 write_config_template() {
@@ -326,6 +341,32 @@ RELEASE_UPGRADE_CHECK=1
 # Paths included when you choose to back up before a release upgrade.
 # Databases (MySQL/MariaDB/PostgreSQL) are dumped separately when running.
 BACKUP_PATHS="/etc /var/www /home /root /var/spool/cron /opt /srv"
+
+# Major-version updates (a change of major.minor in a package matching
+# RISK_PACKAGES, e.g. MariaDB 10.6 -> 10.11 or PHP 8.3 -> 8.4):
+#   hold  - in a terminal you are asked; in scheduled runs they are held back,
+#           the rest is installed, and you are notified
+#   allow - install them (a warning is still logged)
+# One-off override: linux-autoupdate --allow-major
+MAJOR_UPDATES="hold"
+
+# Packages treated as sensitive (space-separated globs).
+RISK_PACKAGES="php* ea-php* mysql* mariadb* percona* postgresql* nginx* apache2* httpd* openssl libssl* libc6 glibc docker* containerd* redis* mongodb* openssh-server podman* runc crun conmon"
+
+# Back up before installing updates:
+#   no     - never (a terminal run still offers a backup before major updates)
+#   major  - before major-version updates
+#   always - before every run that has updates to install
+BACKUP_BEFORE_UPDATE="no"
+
+# Where unattended backups go: an external server over SSH key login
+# (user@host:/path), a directory on another disk, or empty for
+# /var/backups/linux-autoupdate on this server. From a terminal you choose
+# interactively instead.
+BACKUP_DESTINATION=""
+
+# Keep this many backups in the destination (0 = keep all).
+BACKUP_KEEP=3
 EOF
 }
 
@@ -390,6 +431,17 @@ validate_config() {
   [[ $ALLOW_ON_PANELS == [01] ]] || cfg_err "ALLOW_ON_PANELS must be 0 or 1"
   [[ $NOTIFY_TERMINALS == [01] ]] || cfg_err "NOTIFY_TERMINALS must be 0 or 1"
   [[ $RELEASE_UPGRADE_CHECK == [01] ]] || cfg_err "RELEASE_UPGRADE_CHECK must be 0 or 1"
+  case "$MAJOR_UPDATES" in hold|allow) ;; *) cfg_err "MAJOR_UPDATES must be hold or allow" ;; esac
+  case "$BACKUP_BEFORE_UPDATE" in no|major|always) ;; *) cfg_err "BACKUP_BEFORE_UPDATE must be no, major or always" ;; esac
+  re='^[0-9]+$'
+  [[ $BACKUP_KEEP =~ $re ]] || cfg_err "BACKUP_KEEP must be a number"
+  re='^(/[A-Za-z0-9._/+@-]*|([A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+:/[A-Za-z0-9._/+@-]+)?$'
+  [[ $BACKUP_DESTINATION =~ $re ]] || cfg_err "BACKUP_DESTINATION must be /directory or user@host:/path"
+  re='^[A-Za-z0-9][A-Za-z0-9._+*?:-]*$'
+  read -ra excl_check <<<"$RISK_PACKAGES"
+  for p in ${excl_check[@]+"${excl_check[@]}"}; do
+    [[ $p =~ $re ]] || cfg_err "RISK_PACKAGES entry '$p' is not a valid package glob"
+  done
   re='^/[A-Za-z0-9._/+@-]*$'
   read -ra excl_check <<<"$BACKUP_PATHS"
   for p in ${excl_check[@]+"${excl_check[@]}"}; do
@@ -669,8 +721,9 @@ excl_match() {
 }
 
 setup_exclusions() {
-  [[ -n $EXCLUDE_PACKAGES ]] || return 0
-  read -ra EXCL <<<"$EXCLUDE_PACKAGES"
+  local all="$EXCLUDE_PACKAGES $MAJOR_HELD"
+  [[ -n ${all// /} ]] || return 0
+  read -ra EXCL <<<"$all"
   local p pkg held locks
   case "$PM" in
     apt)
@@ -693,7 +746,7 @@ setup_exclusions() {
     pacman)
       EXCL_ARGS+=(--ignore "$(IFS=,; echo "${EXCL[*]}")") ;;
   esac
-  log "Exclusions active: $EXCLUDE_PACKAGES"
+  log "Exclusions active: ${all# }"
   if [[ ${#HELD[@]} -gt 0 ]]; then log "Held ${#HELD[@]} package(s) for this run: ${HELD[*]:0:20}"; fi
   return 0
 }
@@ -927,11 +980,15 @@ pm_update() {
           pkg_run apt-get autoremove -y "${APT_NET[@]}" ;;
       esac ;;
     dnf|yum)
+      # When packages are held back, let the package manager skip anything that
+      # depends on the held version instead of failing the whole transaction.
+      local sb=()
+      if [[ ${#EXCL_ARGS[@]} -gt 0 ]]; then sb=(--skip-broken); fi
       case "$UPDATE_MODE_EFFECTIVE" in
-        php)      pkg_run "$PM" -y ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} upgrade 'php*' 'ea-php*' ;;
-        security) pkg_run "$PM" -y ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} upgrade --security ;;
+        php)      pkg_run "$PM" -y ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} ${sb[@]+"${sb[@]}"} upgrade 'php*' 'ea-php*' ;;
+        security) pkg_run "$PM" -y ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} ${sb[@]+"${sb[@]}"} upgrade --security ;;
         *)
-          pkg_run "$PM" -y ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} upgrade
+          pkg_run "$PM" -y ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} ${sb[@]+"${sb[@]}"} upgrade
           if [[ $PM == dnf ]]; then pkg_run dnf -y autoremove; fi ;;
       esac ;;
     zypper)
@@ -944,7 +1001,13 @@ pm_update() {
       case "$UPDATE_MODE_EFFECTIVE" in
         php)      log "Arch does not support partial upgrades safely; use full update." ;;
         security) unsupported_security ;;
-        *)        pkg_run pacman -Syu --noconfirm ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} ;;
+        *)
+          if [[ -n $MAJOR_HELD ]]; then
+            log "WARNING: Arch does not support partial upgrades, so nothing was updated because major-version updates are waiting for your review. Install everything with: $PROG --allow-major"
+            SKIPPED=1
+          else
+            pkg_run pacman -Syu --noconfirm ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"}
+          fi ;;
       esac ;;
     apk)
       case "$UPDATE_MODE_EFFECTIVE" in
@@ -1042,6 +1105,7 @@ finish_run() {
   state_set REBOOT_PENDING "$REBOOT_PENDING"
   state_set REBOOT_NOTE "$REBOOT_NOTE"
   state_set LAST_WARNING "$(printf '%s' "$REPO_PROBLEM" | head -n1)"
+  state_set HELD_MAJOR "$MAJOR_HELD_DETAIL"
   case "$RESULT" in
     success)
       if (( UPDATED > 0 )); then
@@ -1056,6 +1120,9 @@ finish_run() {
       if [[ -n $REPO_PROBLEM ]]; then
         report_repo_problems
         log "STATUS: CANNOT CONFIRM THE SYSTEM IS UP TO DATE - fix the package source problem above."
+      elif [[ -n $MAJOR_HELD ]]; then
+        log "STATUS: UPDATED, BUT MAJOR UPDATE(S) HELD BACK FOR YOUR REVIEW (with anything that depends on them): $MAJOR_HELD_DETAIL"
+        log "        Install them when you are ready (after a backup): $PROG --allow-major --backup"
       elif (( PENDING_AFTER > 0 )); then
         log "STATUS: $PENDING_AFTER UPDATE(S) STILL PENDING - run it again or see $LOG."
       else
@@ -1070,7 +1137,15 @@ finish_run() {
         log "NOTE: $DEFERRED_COUNT more update(s) are waiting for Ubuntu's phased rollout (or are held back). They install automatically on a later run - no action needed."
       fi ;;
     skipped) log "Nothing was updated (see the warning above)."
-             log "STATUS: NOT UPDATED - this update mode is not supported on this system." ;;
+             if (( MAJOR_BLOCKED )); then
+               log "STATUS: NOT UPDATED - the pending updates depend on major-version update(s) that need your review: $MAJOR_HELD_DETAIL"
+               log "        Review them, then install everything (after a backup): $PROG --allow-major --backup"
+             elif [[ -n $MAJOR_HELD ]]; then
+               log "STATUS: NOT UPDATED - major-version update(s) need your review: $MAJOR_HELD_DETAIL"
+               log "        Install them when you are ready (after a backup): $PROG --allow-major --backup"
+             else
+               log "STATUS: NOT UPDATED - this update mode is not supported on this system."
+             fi ;;
     *)       log "FAILED: the update did not complete - see $LOG for details."
              if [[ -n $REPO_PROBLEM ]]; then report_repo_problems; fi
              log "STATUS: NOT UP TO DATE - the update failed or was refused; the system may be only partly updated." ;;
@@ -1083,13 +1158,22 @@ Packages updated: $UPDATED
 Reboot pending: $REBOOT_PENDING${REBOOT_NOTE:+ ($REBOOT_NOTE)}${RELEASE_AVAILABLE:+
 New Ubuntu release available: $RELEASE_AVAILABLE (run: $PROG release-upgrade)}
 Log: $LOG"
+  if [[ -n $MAJOR_HELD ]]; then
+    body+="
+HELD BACK (major-version update, needs your review): $MAJOR_HELD_DETAIL
+Install after a backup with: $PROG --allow-major --backup"
+  fi
+  if [[ -n $BACKUP_LOCATION ]]; then
+    body+="
+Backup: $BACKUP_LOCATION"
+  fi
   if [[ -n $REPO_PROBLEM ]]; then
     body+="
 WARNING: package source problem - $(printf '%s' "$REPO_PROBLEM" | head -n1)
 $REPO_HINT"
   fi
   case "$RESULT" in
-    success|skipped) if [[ -n $REPO_PROBLEM ]]; then notify failure "$subject" "$body"; else notify success "$subject" "$body"; fi ;;
+    success|skipped) if [[ -n $REPO_PROBLEM || -n $MAJOR_HELD || $MAJOR_BLOCKED -eq 1 ]]; then notify failure "$subject" "$body"; else notify success "$subject" "$body"; fi ;;
     *)               notify failure "$subject" "$body" ;;
   esac
   if [[ $CMD == run ]]; then
@@ -1159,13 +1243,54 @@ cmd_update() {
     apt_heal || log "WARNING: automatic repair did not fully succeed; continuing."
   fi
 
-  setup_exclusions
   say "Refreshing package lists..."
   pm_refresh
+
+  # ---- Review risky (major-version) updates before installing anything ----
+  MAJOR_HELD=""
+  MAJOR_HELD_DETAIL=""
+  local major_kind=normal
+  assess_risk
+  if risk_found; then
+    if is_tty; then
+      show_risk
+    else
+      log "Heads-up: ${#RISK_MAJOR[@]} major-version update(s), ${#RISK_REVIEW[@]} service-package update(s), ${#RISK_KERNEL[@]} kernel update(s) pending."
+    fi
+  fi
+  if [[ ${#RISK_MAJOR[@]} -gt 0 ]]; then
+    if (( ALLOW_MAJOR )) || [[ $MAJOR_UPDATES == allow ]]; then
+      log "WARNING: installing major-version update(s) (allowed): ${RISK_MAJOR[*]}"
+      major_kind=major
+    elif is_tty && ask_yn "Install the major-version update(s) as well?" n; then
+      log "Major-version update(s) approved by the user: ${RISK_MAJOR[*]}"
+      major_kind=major
+    else
+      MAJOR_HELD="${RISK_MAJOR_NAMES[*]}"
+      MAJOR_HELD_DETAIL="${RISK_MAJOR[*]}"
+      log "WARNING: ${#RISK_MAJOR[@]} major-version update(s) held back for your review: $MAJOR_HELD_DETAIL"
+    fi
+  fi
+
+  setup_exclusions
   before=$(pending_count 0)
   say "Found $before pending update(s)."
+  if (( before > 0 )) && ! pre_update_backup "$major_kind"; then
+    log "ERROR: the requested backup did not complete - updates were NOT installed."
+    release_exclusions
+    RESULT="failure"
+    finish_run
+    exit 1
+  fi
   say "Installing updates - this can take several minutes..."
   pm_update
+  if (( FAILED )) && [[ -n $MAJOR_HELD ]] \
+      && tail -c "+$((LOG_START + 1))" "$LOG" | grep -qE 'exclude filtering|conflicting requests|cannot install both|Problem:'; then
+    log "WARNING: the pending updates depend on the held-back major-version update(s), so they cannot be installed separately. Nothing was changed."
+    FAILED=0
+    SKIPPED=1
+    MAJOR_BLOCKED=1
+  fi
   if (( FAILED && ! REFRESH_FAILED )); then
     case "$PM" in
       apt|dnf|yum)
@@ -1256,6 +1381,11 @@ cmd_check() {
   pm_refresh
   say "Pending updates:"
   pm_check
+  assess_risk 1
+  show_risk
+  if [[ ${#RISK_MAJOR[@]} -gt 0 ]]; then
+    log "WARNING: ${#RISK_MAJOR[@]} major-version update(s) need your review. Scheduled runs hold them back; install with: $PROG --allow-major --backup"
+  fi
   total=$(pending_count 0)
   count_deferred
   scan_repo_problems
@@ -1271,6 +1401,10 @@ cmd_check() {
   fi
   if (( DEFERRED_COUNT > 0 )); then
     log "NOTE: $DEFERRED_COUNT more update(s) are waiting for Ubuntu's phased rollout (or are held back). They install automatically on a later run - no action needed."
+  fi
+  reboot_required
+  if (( NEED_REBOOT )); then
+    log "NOTE: this server already needs a reboot ($REBOOT_REASON) - the newest kernel/libraries are not in use yet."
   fi
   release_check
   release_note
@@ -1660,6 +1794,9 @@ cmd_status() {
   else
     echo "Release upgrade:  no new release known (checked on the last run)"
   fi
+  if [[ -n $(state_get HELD_MAJOR) ]]; then
+    echo "Held back:        $(state_get HELD_MAJOR) (major update; install with: $PROG --allow-major --backup)"
+  fi
   if [[ -n $(state_get LAST_RELEASE_UPGRADE) ]]; then
     echo "Last upgrade:     $(state_get LAST_RELEASE_UPGRADE) (backup: $(state_get BACKUP_LOCATION))"
   fi
@@ -1670,11 +1807,160 @@ cmd_status() {
   return 0
 }
 
+# ------------------------------------------------------------ risk review ---
+# Looks at the updates that are about to be installed and flags the ones that
+# can change how a server behaves: kernel, PHP, databases, web servers, OpenSSL,
+# libc and similar (RISK_PACKAGES). A change of major.minor version in one of
+# those is a "major" update: it is held back in unattended runs and asked about
+# in a terminal.
+
+KERNEL_GLOBS="linux-image* linux-modules* kernel kernel-core kernel-modules* kernel-default kernel-lt kernel-ml linux linux-lts linux-hardened linux-zen"
+
+# Print "name<TAB>installed<TAB>new" for every package that would be updated.
+pending_list() {
+  local cached=${1:-0} opt=() out line n old
+  case "$PM" in
+    apt)
+      apt-get -s dist-upgrade 2>/dev/null | awk '/^Inst / {
+        name = $2
+        if ($3 ~ /^\[/) { old = $3; new = $4 } else { old = "-"; new = $3 }
+        gsub(/\[|\]|\(|\)/, "", old); gsub(/\[|\]|\(|\)/, "", new)
+        printf "%s\t%s\t%s\n", name, old, new }' ;;
+    dnf|yum)
+      (( cached )) && opt=(-C)
+      out=$("$PM" ${opt[@]+"${opt[@]}"} -q check-update 2>/dev/null \
+        | awk '/^Obsoleting/ {exit} NF == 3 && $1 ~ /\.[A-Za-z0-9_]+$/ {print $1 "\t" $2}')
+      while IFS=$'\t' read -r n line; do
+        [[ -n $n ]] || continue
+        n=${n%.*}
+        old=$(rpm -q --qf '%{VERSION}-%{RELEASE}\n' "$n" 2>/dev/null | sort -V | tail -n1)
+        printf '%s\t%s\t%s\n' "$n" "${old:--}" "$line"
+      done <<<"$out" ;;
+    zypper)
+      zypper --non-interactive -q list-updates 2>/dev/null | awk -F'|' '/^v/ {
+        gsub(/ /, "", $3); gsub(/ /, "", $4); gsub(/ /, "", $5)
+        printf "%s\t%s\t%s\n", $3, $4, $5 }' ;;
+    pacman)
+      pacman -Qu 2>/dev/null | awk 'NF >= 4 {printf "%s\t%s\t%s\n", $1, $2, $4}' ;;
+    apk)
+      apk version -l '<' 2>/dev/null | awk '/ < / {
+        full = $1; new = $3; name = full; sub(/-[0-9][^ ]*$/, "", name)
+        printf "%s\t%s\t%s\n", name, substr(full, length(name) + 2), new }' ;;
+  esac
+}
+
+# ver_series VERSION N -> first N dot-separated numbers ("1:10.11.8-0ubuntu1" -> "10.11")
+ver_series() {
+  local v=$1 n=$2 parts=() out="" i
+  if [[ $v =~ ^[0-9]+: ]]; then v=${v#*:}; fi
+  [[ $v =~ ^[^0-9]*([0-9]+(\.[0-9]+)*) ]] || return 0
+  IFS=. read -ra parts <<<"${BASH_REMATCH[1]}"
+  for (( i = 0; i < n && i < ${#parts[@]}; i++ )); do
+    out+="${out:+.}${parts[i]}"
+  done
+  printf '%s' "$out"
+}
+
+glob_match() {  # glob_match NAME "glob glob ..."
+  local g globs=()
+  read -ra globs <<<"$2"
+  for g in ${globs[@]+"${globs[@]}"}; do
+    # shellcheck disable=SC2053
+    [[ $1 == $g ]] && return 0
+  done
+  return 1
+}
+
+RISK_MAJOR=()
+RISK_MAJOR_NAMES=()
+RISK_REVIEW=()
+RISK_KERNEL=()
+
+assess_risk() {
+  local name old new a b seen="|"
+  RISK_MAJOR=()
+  RISK_MAJOR_NAMES=()
+  RISK_REVIEW=()
+  RISK_KERNEL=()
+  read -ra EXCL <<<"$EXCLUDE_PACKAGES"
+  while IFS=$'\t' read -r name old new; do
+    [[ -n $name && $old != "-" ]] || continue
+    [[ $seen == *"|$name|"* ]] && continue   # e.g. glibc.i686 and glibc.x86_64
+    seen+="$name|"
+    excl_match "$name" && continue
+    if glob_match "$name" "$KERNEL_GLOBS"; then
+      RISK_KERNEL+=("$name  $old -> $new")
+      continue
+    fi
+    glob_match "$name" "$RISK_PACKAGES" || continue
+    a=$(ver_series "$old" 2)
+    b=$(ver_series "$new" 2)
+    if [[ -n $a && -n $b && $a != "$b" ]]; then
+      RISK_MAJOR+=("$name  $old -> $new")
+      RISK_MAJOR_NAMES+=("$name")
+    else
+      RISK_REVIEW+=("$name  $old -> $new")
+    fi
+  done < <(pending_list "${1:-0}")
+}
+
+risk_found() { (( ${#RISK_MAJOR[@]} + ${#RISK_REVIEW[@]} + ${#RISK_KERNEL[@]} > 0 )); }
+
+print_risk_group() {  # title, then lines
+  local title=$1 shown=0 l
+  shift
+  echo "  $title"
+  for l in "$@"; do
+    if (( shown >= 12 )); then echo "      ... and $(( $# - shown )) more"; break; fi
+    echo "      $l"
+    shown=$((shown + 1))
+  done
+}
+
+show_risk() {
+  risk_found || return 0
+  echo
+  echo "Heads-up - review before installing:"
+  if [[ ${#RISK_MAJOR[@]} -gt 0 ]]; then
+    print_risk_group "MAJOR VERSION CHANGE (can change behaviour or break apps):" "${RISK_MAJOR[@]}"
+  fi
+  if [[ ${#RISK_REVIEW[@]} -gt 0 ]]; then
+    print_risk_group "Service packages, same major version (services may restart briefly):" "${RISK_REVIEW[@]}"
+  fi
+  if [[ ${#RISK_KERNEL[@]} -gt 0 ]]; then
+    print_risk_group "Kernel (needs a reboot to take effect):" "${RISK_KERNEL[@]}"
+  fi
+  echo
+}
+
+# Runs a backup before updating when asked for. Returns 1 if a backup that was
+# requested failed or was cancelled (the updates must then not be installed).
+pre_update_backup() {  # $1 = major|normal
+  local want=0
+  case "$BACKUP_BEFORE_UPDATE" in
+    always) want=1 ;;
+    major)  [[ $1 == major ]] && want=1 ;;
+  esac
+  if (( FLAG_BACKUP )); then want=1; fi
+  if (( want == 0 )) && [[ $1 == major ]] && is_tty; then want=1; fi
+  (( want )) || return 0
+  if is_tty; then
+    backup_flow "$([[ $1 == major ]] && echo "major-version updates can change how your services behave" || echo "an update can occasionally go wrong")" || return 1
+  else
+    log "Backing up before updating to ${BACKUP_DESTINATION:-/var/backups/linux-autoupdate} ..."
+    backup_to "${BACKUP_DESTINATION:-/var/backups/linux-autoupdate}" || return 1
+  fi
+  state_set BACKUP_LOCATION "$BACKUP_LOCATION"
+  state_set BACKUP_TIME "$(now)"
+  log "Backup before update: $BACKUP_LOCATION"
+}
+
 # ------------------------------------------------------- release upgrade ---
 # Interactive OS release upgrade (Ubuntu only). Never started by the timer,
 # cron or 'run': those only record that a new release is available.
 
-is_tty() { [[ -t 0 && -t 1 ]]; }
+# True when we may ask questions: a real terminal, and not a scheduled-style 'run'.
+is_tty() { [[ -t 0 && -t 1 && $CMD != run && $CMD != postboot ]]; }
 
 # ask_yn "question" y|n  -> 0 for yes, 1 for no / end of input
 ask_yn() {
@@ -1969,47 +2255,63 @@ EOF
   echo "Backup verified: $dir ($(du -sh "$dir" | awk '{print $1}'))"
 }
 
-backup_local() {  # $1 = base directory, $2 = description
+BACKUP_RE_REMOTE='^([A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+:/[A-Za-z0-9._/+@-]+$'
+
+# Keep only the newest BACKUP_KEEP of our own backup sets in directory $1.
+prune_backups_local() {
+  local base=$1 d
+  (( BACKUP_KEEP > 0 )) || return 0
+  # shellcheck disable=SC2012
+  ls -1dt "$base"/linux-autoupdate-backup-* 2>/dev/null | tail -n "+$((BACKUP_KEEP + 1))" | while read -r d; do
+    rm -rf -- "$d"
+  done
+}
+
+backup_local() {  # $1 = base directory, $2 = different|same|auto
   local base=$1 dir
   [[ $base =~ ^/[A-Za-z0-9._/+@-]+$ ]] || { echo "Please give an absolute path without spaces."; return 1; }
   if [[ ! -d $base ]]; then
-    ask_yn "$base does not exist. Create it?" y || return 1
+    if is_tty && ! ask_yn "$base does not exist. Create it?" y; then return 1; fi
     mkdir -p "$base" || return 1
   fi
   if [[ $2 == different ]] && [[ $(stat -c %d "$base") == "$(stat -c %d /)" ]]; then
-    echo "$base is on the same disk as the system, so it is not a different location."
-    echo "Use a separate disk/mount, a remote server, or choose option 2."
+    echo "$base is on the same disk as the system, so it is not a different disk."
+    echo "Use a separate disk/mount, an external server, or the same-server option."
     return 1
   fi
   dir="$base/linux-autoupdate-backup-$(host_name)-$(date +%Y%m%d-%H%M%S)"
   make_backup "$dir" || return 1
   BACKUP_LOCATION="$dir"
+  prune_backups_local "$base"
 }
 
-backup_remote() {  # $1 = [user@]host:/path
-  local dest=$1 host rpath stage name
+# The remote path is validated against BACKUP_RE_REMOTE, so expanding it here is intended.
+# shellcheck disable=SC2029
+backup_remote() {  # $1 = [user@]host:/path  (key-based login when not in a terminal)
+  local dest=$1 host rpath stage name ssh_opts=(-o ConnectTimeout=15)
   host=${dest%%:*}
   rpath=${dest#*:}
+  if ! is_tty; then ssh_opts+=(-o BatchMode=yes); fi
   if ! command -v ssh >/dev/null 2>&1 || ! command -v scp >/dev/null 2>&1; then
     echo "ssh/scp not found."
     return 1
   fi
   name="linux-autoupdate-backup-$(host_name)-$(date +%Y%m%d-%H%M%S)"
   stage=$(mktemp -d /var/tmp/lau-backup.XXXXXX) || return 1
-  echo "Checking the connection to $host (you may be asked for a password)..."
-  if ! ssh -o ConnectTimeout=15 "$host" "mkdir -p '$rpath'"; then
-    echo "Could not reach $host."
+  if is_tty; then echo "Checking the connection to $host (you may be asked for a password)..."; fi
+  if ! ssh "${ssh_opts[@]}" "$host" "mkdir -p '$rpath'"; then
+    echo "Could not reach $host. An unattended run needs SSH key login, and the server must already be in known_hosts (run 'ssh $host' once by hand)."
     rm -rf "$stage"
     return 1
   fi
   if ! make_backup "$stage/$name"; then rm -rf "$stage"; return 1; fi
   say "Copying the backup to $host:$rpath ..."
-  if ! scp -rpq -o ConnectTimeout=15 "$stage/$name" "$host:$rpath/"; then
+  if ! scp -rpq "${ssh_opts[@]}" "$stage/$name" "$host:$rpath/"; then
     echo "Copy failed."
     rm -rf "$stage"
     return 1
   fi
-  if ! ssh -o ConnectTimeout=15 "$host" "cd '$rpath/$name' && sha256sum -c SHA256SUMS >/dev/null 2>&1"; then
+  if ! ssh "${ssh_opts[@]}" "$host" "cd '$rpath/$name' && sha256sum -c SHA256SUMS >/dev/null 2>&1"; then
     echo "The copy on $host failed its checksum verification."
     rm -rf "$stage"
     return 1
@@ -2017,53 +2319,69 @@ backup_remote() {  # $1 = [user@]host:/path
   rm -rf "$stage"
   BACKUP_LOCATION="$host:$rpath/$name"
   echo "Backup copied and verified on $host:$rpath/$name"
+  if (( BACKUP_KEEP > 0 )); then
+    ssh "${ssh_opts[@]}" "$host" "cd '$rpath' && ls -1dt linux-autoupdate-backup-* 2>/dev/null | tail -n +$((BACKUP_KEEP + 1)) | while read -r d; do rm -rf -- \"\$d\"; done" >/dev/null 2>&1
+  fi
 }
 
+# Unattended backup to a configured destination (remote user@host:/path or a directory).
+backup_to() {
+  local dest=$1
+  if [[ $dest =~ $BACKUP_RE_REMOTE ]]; then
+    backup_remote "$dest"
+  else
+    backup_local "$dest" auto
+  fi
+}
+
+# Interactive backup menu. $1 = why a backup is advised.
 # Returns 0 when it is safe to continue, 1 when the user cancelled.
 backup_flow() {
-  local choice dest re_remote='^([A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+:/[A-Za-z0-9._/+@-]+$'
+  local choice dest reason=${1:-"this change cannot easily be undone"}
   echo
-  echo "Data safety - a release upgrade cannot be undone, so back up first."
+  echo "Data safety - $reason, so back up first."
   while true; do
     cat <<'EOF'
 
-  1) Back up to a DIFFERENT location (recommended)
-     another disk/mount on this server, or a remote server over SSH
-  2) Back up on THIS server
-     fast, but lost if this disk or server fails
-  3) I already have a snapshot/backup (e.g. a VPS snapshot) I can restore
-  4) No backup needed (test server, nothing important)
-  5) Cancel the upgrade
+  1) Back up to an EXTERNAL server over SSH (recommended)
+  2) Back up to a different disk or mount on THIS server
+  3) Back up on THIS server, same disk (quick, but lost if the disk or server fails)
+  4) I already have a snapshot/backup (e.g. a VPS snapshot) I can restore
+  5) No backup needed (test server, nothing important)
+  6) Cancel
 EOF
-    read -r -p "Choose 1-5: " choice || return 1
+    read -r -p "Choose 1-6: " choice || return 1
     case "$choice" in
       1)
-        read -r -p "Mounted directory (e.g. /mnt/backup) or remote user@host:/path: " dest || return 1
-        if [[ $dest =~ $re_remote ]]; then
+        read -r -p "External server as user@host:/path (SSH login needed): " dest || return 1
+        if [[ $dest =~ $BACKUP_RE_REMOTE ]]; then
           backup_remote "$dest" && return 0
         else
-          backup_local "$dest" different && return 0
+          echo "Please use the form user@host:/absolute/path"
         fi ;;
       2)
+        read -r -p "Mounted directory on another disk (e.g. /mnt/backup): " dest || return 1
+        backup_local "$dest" different && return 0 ;;
+      3)
         read -r -p "Directory on this server [/var/backups/linux-autoupdate]: " dest || return 1
         backup_local "${dest:-/var/backups/linux-autoupdate}" same && {
-          echo "Note: this backup is on the same server. It protects against a failed upgrade, not against disk or server loss."
+          echo "Note: this backup is on the same server. It protects against a failed change, not against disk or server loss."
           return 0
         } ;;
-      3)
+      4)
         if ask_yn "Do you have a recent snapshot/backup stored outside this server's disk, and can you restore it?" n; then
           BACKUP_LOCATION="existing snapshot/backup (confirmed by user)"
           return 0
         fi ;;
-      4)
-        echo "Without a backup, a failed upgrade can mean data loss."
+      5)
+        echo "Without a backup, a failure can mean data loss."
         read -r -p 'Type NO BACKUP to continue without one: ' dest || return 1
         if [[ $dest == "NO BACKUP" ]]; then
           BACKUP_LOCATION="none (declined by user)"
           return 0
         fi ;;
-      5) return 1 ;;
-      *) echo "Please choose 1-5." ;;
+      6) return 1 ;;
+      *) echo "Please choose 1-6." ;;
     esac
   done
 }
@@ -2128,7 +2446,7 @@ release_verify() {
 release_upgrade_flow() {
   local from_pretty=$OS_PRETTY from_ver=$OS_VERSION_ID
   release_preflight || return 1
-  backup_flow || { echo "Upgrade cancelled - nothing was changed."; log "Release upgrade cancelled at the backup step"; return 1; }
+  backup_flow "a release upgrade cannot be undone" || { echo "Upgrade cancelled - nothing was changed."; log "Release upgrade cancelled at the backup step"; return 1; }
   state_set BACKUP_LOCATION "$BACKUP_LOCATION"
   state_set BACKUP_TIME "$(now)"
   log "Backup/safety choice: $BACKUP_LOCATION"
